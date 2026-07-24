@@ -9,6 +9,7 @@ use rfd::FileDialog;
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver, TryRecvError},
 };
 
 const APP_NAME: &str = "Aurora TLK Explorer";
@@ -93,6 +94,12 @@ enum RowMenuAction {
     InsertBelow(usize),
 }
 
+struct PendingOpen {
+    path: PathBuf,
+    report_errors: bool,
+    receiver: Receiver<anyhow::Result<Document>>,
+}
+
 pub struct AuroraApp {
     documents: Vec<Document>,
     active: Option<usize>,
@@ -108,11 +115,14 @@ pub struct AuroraApp {
     show_diff_overview: bool,
     search_window_open: bool,
     focus_search_window: bool,
+    pending_opens: Vec<PendingOpen>,
+    restore_active_file: Option<PathBuf>,
 }
 
 impl AuroraApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let state = PersistentState::load();
+        let restore_active_file = state.active_file.clone();
         Self::apply_theme(&cc.egui_ctx, state.theme);
         let mut app = Self {
             documents: Vec::new(),
@@ -129,6 +139,8 @@ impl AuroraApp {
             show_diff_overview: false,
             search_window_open: false,
             focus_search_window: false,
+            pending_opens: Vec::new(),
+            restore_active_file,
         };
 
         let startup_files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
@@ -137,14 +149,6 @@ impl AuroraApp {
             if path.is_file() {
                 app.open_path(&path, false);
             }
-        }
-        if let Some(wanted) = app.state.active_file.clone()
-            && let Some(index) = app
-                .documents
-                .iter()
-                .position(|d| d.path.as_ref() == Some(&wanted))
-        {
-            app.active = Some(index);
         }
         app
     }
@@ -189,6 +193,11 @@ impl AuroraApp {
             .documents
             .iter()
             .filter_map(|d| d.path.clone())
+            .chain(
+                self.pending_opens
+                    .iter()
+                    .map(|pending| pending.path.clone()),
+            )
             .collect();
         self.state.active_file = self
             .active
@@ -208,18 +217,60 @@ impl AuroraApp {
             self.active = Some(index);
             return;
         }
-        match Document::open(&canonical) {
-            Ok(document) => {
-                self.state.last_directory = canonical.parent().map(Path::to_path_buf);
-                self.documents.push(document);
-                self.active = Some(self.documents.len() - 1);
-                self.sync_state();
+        if self
+            .pending_opens
+            .iter()
+            .any(|pending| pending.path == canonical)
+        {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        let worker_path = canonical.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(Document::open(&worker_path));
+        });
+        self.pending_opens.push(PendingOpen {
+            path: canonical,
+            report_errors,
+            receiver,
+        });
+    }
+
+    fn poll_open_jobs(&mut self) {
+        while let Some(pending) = self.pending_opens.first() {
+            let result = match pending.receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err(anyhow::anyhow!(
+                    "The file-loading worker stopped unexpectedly"
+                ))),
+            };
+            let Some(result) = result else {
+                break;
+            };
+            let pending = self.pending_opens.remove(0);
+            match result {
+                Ok(document) => {
+                    self.state.last_directory = pending.path.parent().map(Path::to_path_buf);
+                    self.documents.push(document);
+                    let opened = self.documents.len() - 1;
+                    let wanted = self.restore_active_file.as_ref() == Some(&pending.path);
+                    if pending.report_errors || wanted || self.active.is_none() {
+                        self.active = Some(opened);
+                    }
+                    self.sync_state();
+                }
+                Err(error) if pending.report_errors => {
+                    self.set_message(
+                        format!("Could not open {}: {error:#}", pending.path.display()),
+                        true,
+                    );
+                    self.sync_state();
+                }
+                Err(_) => {
+                    self.sync_state();
+                }
             }
-            Err(error) if report_errors => self.set_message(
-                format!("Could not open {}: {error:#}", path.display()),
-                true,
-            ),
-            Err(_) => {}
         }
     }
 
@@ -3731,6 +3782,10 @@ impl AuroraApp {
 impl eframe::App for AuroraApp {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
+        self.poll_open_jobs();
+        if !self.pending_opens.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_exit {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             if self.pending_close.is_none() {
@@ -3882,6 +3937,8 @@ mod tests {
             show_diff_overview: false,
             search_window_open: false,
             focus_search_window: false,
+            pending_opens: Vec::new(),
+            restore_active_file: None,
         };
 
         assert!(app.copy_selected_row(&egui::Context::default()));
@@ -3927,6 +3984,8 @@ mod tests {
             show_diff_overview: false,
             search_window_open: false,
             focus_search_window: false,
+            pending_opens: Vec::new(),
+            restore_active_file: None,
         };
 
         assert!(app.copy_selected_row(&egui::Context::default()));
