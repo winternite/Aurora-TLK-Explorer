@@ -2,7 +2,7 @@
 
 A native Rust editor for Neverwinter Nights talk tables, 2DA data files, and ITP palettes.
 
-Aurora TLK Explorer 1.1 is production software distributed under the
+Aurora TLK Explorer 1.1.1 is production software distributed under the
 [GNU General Public License version 3 or later](LICENSE). Release archives include
 the corresponding source and third-party notices.
 
@@ -24,6 +24,7 @@ the corresponding source and third-party notices.
 - Delete all selected 2DA rows in one undoable operation
 - Find/replace and find-next navigation
 - Row cut/copy/paste through the system clipboard and between tabs
+- Spreadsheet-style 2DA field pasting and double-click Select All
 - Undo/redo for cell, row, resize, renumber, and column operations
 - TLK V3.0 encoding selection and multiline entry editing
 - User StrRef and hexadecimal StrRef display modes

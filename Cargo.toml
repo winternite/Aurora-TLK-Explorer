@@ -1,6 +1,6 @@
 [package]
 name = "aurora-tlk-explorer"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 description = "A native editor for Neverwinter Nights TLK, 2DA, and ITP files"
 license = "GPL-3.0-or-later"

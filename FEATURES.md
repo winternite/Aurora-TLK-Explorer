@@ -1,4 +1,4 @@
-# Aurora TLK Explorer 1.1.0 features
+# Aurora TLK Explorer 1.1.1 features
 
 - Edit Neverwinter Nights `.tlk`, text/binary `.2da`, and `.itp` palette files.
 - Open multiple documents in tabs from the app, file manager, or drag-and-drop.
@@ -10,6 +10,8 @@
 - Insert multiple blank TLK or 2DA rows above or below the selection.
 - Move between editable TLK and 2DA table text fields with the Up and Down
   arrow keys.
+- Paste copied 2DA fields over the selected destination fields, and
+  double-click a 2DA field to select all of its text.
 - Keep 2DA Index and TLK StrRef columns visible while scrolling horizontally.
 - View User StrRef and hexadecimal StrRef representations.
 - Use TlkEdit-compatible diff, DTU merge, marking, and overview workflows.

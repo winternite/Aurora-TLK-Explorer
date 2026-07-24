@@ -3,6 +3,12 @@
 All notable user-visible changes are documented here. This project follows
 Semantic Versioning.
 
+## 1.1.1 - 2026-07-24
+
+- Made 2DA field pastes replace the clicked destination cells, matching normal
+  spreadsheet behavior.
+- Added double-click Select All for editable 2DA table fields.
+
 ## 1.1.0 - 2026-07-24
 
 - Added desktop/file-manager opening, drag-and-drop, and single-instance file

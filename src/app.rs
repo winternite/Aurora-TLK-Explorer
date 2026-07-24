@@ -907,6 +907,36 @@ impl AuroraApp {
         Id::new(("twoda_text_cell", document_id, row, column))
     }
 
+    fn select_all_text(ui: &egui::Ui, text_cell_id: Id, text: &str) {
+        let mut state = TextEdit::load_state(ui.ctx(), text_cell_id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::default(),
+                egui::text::CCursor::new(text.chars().count()),
+            )));
+        state.store(ui.ctx(), text_cell_id);
+    }
+
+    /// Takes a paste aimed at this focused table editor. Table-level paste
+    /// commands consume their event first; this is the fallback for a native
+    /// text-editor paste, which must replace rather than append to a 2DA cell.
+    fn take_focused_text_paste(ui: &mut egui::Ui, text_cell_id: Id) -> Option<String> {
+        if !ui.memory(|memory| memory.has_focus(text_cell_id)) {
+            return None;
+        }
+        ui.input_mut(|input| {
+            let index = input
+                .events
+                .iter()
+                .rposition(|event| matches!(event, egui::Event::Paste(_)))?;
+            let egui::Event::Paste(text) = input.events.remove(index) else {
+                unreachable!("paste event index must contain a paste event");
+            };
+            Some(text)
+        })
+    }
+
     fn row_action_context_menu(
         response: &egui::Response,
         row: usize,
@@ -1586,18 +1616,41 @@ impl AuroraApp {
                 {
                     let mut actions = Vec::new();
                     let mut selected = BTreeSet::new();
-                    for (column, value) in cells {
-                        if let Some(cell) = table.rows[destination_row].get_mut(column) {
-                            let before = std::mem::replace(cell, value);
+                    // A clicked cell is the paste target. This makes field
+                    // pastes behave like a spreadsheet: copied values replace
+                    // the existing contents at the destination instead of
+                    // being inserted at the caret or written back to their
+                    // original columns.
+                    let destination_cells: Vec<(usize, usize)> =
+                        if !document.selected_cells.is_empty() {
+                            document.selected_cells.iter().copied().collect()
+                        } else if let Some(column) = document.selected_column {
+                            vec![(destination_row, column)]
+                        } else {
+                            cells
+                                .iter()
+                                .map(|(column, _)| (destination_row, *column))
+                                .collect()
+                        };
+                    let copied_values: Vec<String> =
+                        cells.into_iter().map(|(_, value)| value).collect();
+                    for ((row, column), value) in destination_cells
+                        .into_iter()
+                        .zip(copied_values.iter().cycle())
+                    {
+                        if let Some(cell) =
+                            table.rows.get_mut(row).and_then(|row| row.get_mut(column))
+                        {
+                            let before = std::mem::replace(cell, value.clone());
                             if *cell != before {
                                 actions.push(EditAction::TwoDaCell {
-                                    row: destination_row,
+                                    row,
                                     column,
                                     before,
                                     after: cell.clone(),
                                 });
                             }
-                            selected.insert((destination_row, column));
+                            selected.insert((row, column));
                         }
                     }
                     inserted = selected.len();
@@ -2358,6 +2411,15 @@ impl AuroraApp {
                     .events
                     .iter()
                     .any(|event| matches!(event, egui::Event::Paste(_)));
+            // `paste_rows` owns a paste aimed at a selected table cell. Remove
+            // the event after recognizing it so the focused TextEdit cannot
+            // process the same paste a second time and append it after the
+            // replacement has been applied.
+            if paste_event {
+                input
+                    .events
+                    .retain(|event| !matches!(event, egui::Event::Paste(_)));
+            }
             if cut_event {
                 Some(Command::Cut)
             } else if copy_event {
@@ -3759,6 +3821,9 @@ impl AuroraApp {
                             }
                             let text_cell_id =
                                 Self::twoda_text_cell_id(doc.id, row_index, column_index);
+                            if let Some(text) = Self::take_focused_text_paste(ui, text_cell_id) {
+                                *cell = text;
+                            }
                             let response = ui.add(
                                 TextEdit::singleline(cell)
                                     .id(text_cell_id)
@@ -3782,6 +3847,10 @@ impl AuroraApp {
                                 );
                                 doc.selected_row = Some(row_index);
                                 doc.selected_column = Some(column_index);
+                            }
+                            if response.double_clicked() {
+                                response.request_focus();
+                                Self::select_all_text(ui, text_cell_id, cell);
                             }
                             if let Some(direction) =
                                 Self::text_field_vertical_movement(ui, &response)
@@ -4885,6 +4954,136 @@ mod tests {
             unreachable!();
         };
         assert_eq!(table.rows[1], vec!["1", "source", "42"]);
+        assert_eq!(
+            app.documents[0].selected_cells,
+            BTreeSet::from([(1, 1), (1, 2)])
+        );
+    }
+
+    #[test]
+    fn copied_field_replaces_only_the_clicked_destination_cell() {
+        let mut document = Document::new_twoda();
+        let DocumentData::TwoDa(table) = &mut document.data else {
+            unreachable!();
+        };
+        table.columns = vec!["Row".into(), "One".into(), "Two".into(), "Three".into()];
+        table.rows = vec![
+            vec![
+                "0".into(),
+                "source one".into(),
+                "source two".into(),
+                "keep".into(),
+            ],
+            vec![
+                "1".into(),
+                "old one".into(),
+                "old two".into(),
+                "old three".into(),
+            ],
+        ];
+        document.selected_row = Some(0);
+        document.selected_column = Some(1);
+        document.selected_cells.extend([(0, 1), (0, 2)]);
+
+        let mut app = AuroraApp {
+            documents: vec![document],
+            active: Some(0),
+            state: PersistentState::default(),
+            pending_close: None,
+            allow_exit: false,
+            quit_after_saves: false,
+            message: None,
+            clipboard: None,
+            clipboard_text: None,
+            pending_paste_text: None,
+            resize_value: None,
+            column_dialog: None,
+            row_insert_dialog: None,
+            show_diff_overview: false,
+            search_window_open: false,
+            focus_search_window: false,
+            pending_opens: Vec::new(),
+            queued_opens: VecDeque::new(),
+            pending_saves: Vec::new(),
+            queued_saves: VecDeque::new(),
+            restore_active_file: None,
+            last_window_title: None,
+            incoming_paths: None,
+        };
+
+        assert!(app.copy_selected_row(&egui::Context::default()));
+        let document = &mut app.documents[0];
+        document.selected_cells = BTreeSet::from([(1, 2)]);
+        document.selected_row = Some(1);
+        document.selected_column = Some(2);
+        app.paste_rows();
+
+        let DocumentData::TwoDa(table) = &app.documents[0].data else {
+            unreachable!();
+        };
+        assert_eq!(
+            table.rows[1],
+            vec!["1", "old one", "source one", "old three"]
+        );
+        assert_eq!(app.documents[0].selected_cells, BTreeSet::from([(1, 2)]));
+    }
+
+    #[test]
+    fn copied_field_fills_every_selected_destination_cell() {
+        let mut document = Document::new_twoda();
+        let DocumentData::TwoDa(table) = &mut document.data else {
+            unreachable!();
+        };
+        table.columns = vec!["Row".into(), "One".into(), "Two".into()];
+        table.rows = vec![
+            vec!["0".into(), "copied".into(), "source".into()],
+            vec![
+                "1".into(),
+                "first old value".into(),
+                "second old value".into(),
+            ],
+        ];
+        document.selected_row = Some(0);
+        document.selected_column = Some(1);
+        document.selected_cells.insert((0, 1));
+
+        let mut app = AuroraApp {
+            documents: vec![document],
+            active: Some(0),
+            state: PersistentState::default(),
+            pending_close: None,
+            allow_exit: false,
+            quit_after_saves: false,
+            message: None,
+            clipboard: None,
+            clipboard_text: None,
+            pending_paste_text: None,
+            resize_value: None,
+            column_dialog: None,
+            row_insert_dialog: None,
+            show_diff_overview: false,
+            search_window_open: false,
+            focus_search_window: false,
+            pending_opens: Vec::new(),
+            queued_opens: VecDeque::new(),
+            pending_saves: Vec::new(),
+            queued_saves: VecDeque::new(),
+            restore_active_file: None,
+            last_window_title: None,
+            incoming_paths: None,
+        };
+
+        assert!(app.copy_selected_row(&egui::Context::default()));
+        let document = &mut app.documents[0];
+        document.selected_row = Some(1);
+        document.selected_column = Some(2);
+        document.selected_cells = BTreeSet::from([(1, 1), (1, 2)]);
+        app.paste_rows();
+
+        let DocumentData::TwoDa(table) = &app.documents[0].data else {
+            unreachable!();
+        };
+        assert_eq!(table.rows[1], vec!["1", "copied", "copied"]);
         assert_eq!(
             app.documents[0].selected_cells,
             BTreeSet::from([(1, 1), (1, 2)])
