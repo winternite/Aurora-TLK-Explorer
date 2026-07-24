@@ -1,0 +1,12 @@
+/target/
+/AppDir/
+/dist/
+/fuzz/artifacts/
+/fuzz/corpus/
+*.AppImage
+*.AppImage.zsync
+*.exe.sha256
+*.zip
+*~
+*.aurora-tmp*
+*.aurora-encoded*

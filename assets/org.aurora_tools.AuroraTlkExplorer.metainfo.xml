@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.aurora_tools.AuroraTlkExplorer</id>
+  <name>Aurora TLK Explorer</name>
+  <summary>Edit Neverwinter Nights TLK, 2DA, and ITP files</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <description>
+    <p>
+      Aurora TLK Explorer is a native editor for Neverwinter Nights talk tables,
+      2DA data files, and ITP palette trees.
+    </p>
+  </description>
+  <launchable type="desktop-id">org.aurora_tools.AuroraTlkExplorer.desktop</launchable>
+  <provides>
+    <binary>aurora-tlk-explorer</binary>
+  </provides>
+  <releases>
+    <release version="1.0.0" date="2026-07-17"/>
+  </releases>
+</component>

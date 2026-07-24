@@ -1,0 +1,31 @@
+[package]
+name = "aurora-tlk-explorer"
+version = "1.0.0"
+edition = "2024"
+description = "A native editor for Neverwinter Nights TLK, 2DA, and ITP files"
+license = "GPL-3.0-or-later"
+build = "build.rs"
+
+[dependencies]
+anyhow = "1"
+directories = "6"
+eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "persistence", "wayland", "x11"] }
+egui_extras = { version = "0.35.0", path = "vendor/egui_extras" }
+encoding_rs = "0.8"
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "pollster", "wayland"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+winresource = "0.1"
+
+[patch.crates-io]
+# wayland-scanner 0.31.10 restricts quick-xml to the advisory-affected 0.39
+# series. This source-identical vendored copy widens that dependency to the
+# compatible, fixed 0.41 series until upstream publishes a release.
+wayland-scanner = { path = "vendor/wayland-scanner" }
+
+[profile.release]
+lto = "thin"
+strip = true
+opt-level = 2

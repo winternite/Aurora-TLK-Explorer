@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Aurora TLK Explorer
+Comment=Edit Neverwinter Nights TLK and 2DA files
+Exec=aurora-tlk-explorer %F
+Icon=aurora-tlk-explorer
+Categories=Development;
+Terminal=false
+MimeType=application/x-nwn-tlk;application/x-nwn-2da;
+StartupWMClass=org.aurora_tools.AuroraTlkExplorer

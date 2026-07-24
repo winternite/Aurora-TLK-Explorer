@@ -1,0 +1,25 @@
+#!/bin/sh
+APPDIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+export PATH="$APPDIR/usr/bin${PATH:+:$PATH}"
+
+# KDE Wayland resolves the window icon through the app's desktop ID. Install a
+# hidden desktop entry so the title bar gets the Aurora icon without adding ATE
+# to the application launcher.
+if [ -n "${HOME:-}" ]; then
+    DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+    ICON_DIR="$DATA_HOME/icons/hicolor/512x512/apps"
+    DESKTOP_DIR="$DATA_HOME/applications"
+    if mkdir -p "$ICON_DIR" "$DESKTOP_DIR" 2>/dev/null; then
+        cp "$APPDIR/aurora-tlk-explorer.png" \
+            "$ICON_DIR/aurora-tlk-explorer.png" 2>/dev/null || true
+        awk '
+            /^Exec=/ { print "Exec=\"" ENVIRON["APPIMAGE"] "\" %F"; next }
+            /^NoDisplay=/ { next }
+            { print }
+            /^\[Desktop Entry\]$/ { print "NoDisplay=true" }
+        ' "$APPDIR/org.aurora_tools.AuroraTlkExplorer.desktop" \
+            > "$DESKTOP_DIR/org.aurora_tools.AuroraTlkExplorer.desktop" 2>/dev/null || true
+    fi
+fi
+
+exec "$APPDIR/usr/bin/aurora-tlk-explorer" "$@"

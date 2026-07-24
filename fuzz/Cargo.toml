@@ -1,0 +1,26 @@
+[package]
+name = "aurora-tlk-explorer-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+aurora-tlk-explorer = { path = ".." }
+
+[[bin]]
+name = "tlk"
+path = "fuzz_targets/tlk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "twoda"
+path = "fuzz_targets/twoda.rs"
+test = false
+doc = false
+bench = false
