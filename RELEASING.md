@@ -32,6 +32,10 @@ manual Windows 10/11 GUI test in step 3.
 - 64-bit Linux distributions with glibc 2.17 or newer, Wayland or X11.
 - 64-bit Windows 10 and Windows 11.
 
+ATE is an application, not a crates.io library package. Its authoritative
+source artifact is the complete, vendor-inclusive archive produced from the
+release tag by the source-build script.
+
 Release binaries are portable. The AppImage bundles the pinned ITP converter;
 the Windows executable embeds it. The source archive is the corresponding
 source required by GPL-3.0-or-later.
