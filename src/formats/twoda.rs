@@ -1,5 +1,9 @@
 use anyhow::{Context, Result, bail};
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, path::Path};
+
+const MAX_COLUMNS: usize = 4096;
+const MAX_ROWS: usize = 250_000;
+const MAX_CELLS: usize = 2_000_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TwoDaFormat {
@@ -19,30 +23,30 @@ pub struct TwoDaFile {
 
 fn tokenize(line: &str) -> Result<Vec<String>> {
     let mut fields = Vec::new();
-    let chars: Vec<char> = line.chars().collect();
-    let mut pos = 0;
-    while pos < chars.len() {
-        while pos < chars.len() && chars[pos].is_whitespace() {
-            pos += 1;
-        }
-        if pos == chars.len() {
-            break;
-        }
+    let mut chars = line.chars().peekable();
+    loop {
+        while chars
+            .next_if(|character| character.is_whitespace())
+            .is_some()
+        {}
+        let Some(first) = chars.next() else { break };
         let mut value = String::new();
-        if chars[pos] == '"' {
-            pos += 1;
-            while pos < chars.len() && chars[pos] != '"' {
-                value.push(chars[pos]);
-                pos += 1;
+        if first == '"' {
+            let mut closed = false;
+            for character in chars.by_ref() {
+                if character == '"' {
+                    closed = true;
+                    break;
+                }
+                value.push(character);
             }
-            if pos == chars.len() {
+            if !closed {
                 bail!("Unterminated quoted value");
             }
-            pos += 1;
         } else {
-            while pos < chars.len() && !chars[pos].is_whitespace() {
-                value.push(chars[pos]);
-                pos += 1;
+            value.push(first);
+            while let Some(character) = chars.next_if(|character| !character.is_whitespace()) {
+                value.push(character);
             }
         }
         fields.push(value);
@@ -65,7 +69,7 @@ fn quoted(value: &str) -> Result<String> {
 
 impl TwoDaFile {
     pub fn read(path: &Path) -> Result<Self> {
-        let bytes = fs::read(path).with_context(|| format!("Could not read {}", path.display()))?;
+        let bytes = super::read_file_limited(path, "2DA file")?;
         if bytes.starts_with(b"2DA V2.b\n") {
             return Self::parse_binary(&bytes);
         }
@@ -102,6 +106,9 @@ impl TwoDaFile {
             }
         }
         let data_columns = columns.len() - 1;
+        if data_columns > MAX_COLUMNS {
+            bail!("Binary 2DA contains too many columns");
+        }
         let row_count = u32::from_le_bytes(
             data.get(cursor..cursor + 4)
                 .context("Truncated binary 2DA row count")?
@@ -109,6 +116,23 @@ impl TwoDaFile {
                 .unwrap(),
         ) as usize;
         cursor += 4;
+        if row_count > MAX_ROWS {
+            bail!("Binary 2DA contains too many rows");
+        }
+        let minimum_index_bytes = row_count
+            .checked_mul(data_columns)
+            .and_then(|count| count.checked_mul(2))
+            .context("Binary 2DA is too large")?;
+        let minimum_remaining = row_count
+            .checked_add(minimum_index_bytes)
+            .and_then(|count| count.checked_add(2))
+            .context("Binary 2DA is too large")?;
+        if minimum_remaining > data.len().saturating_sub(cursor) {
+            bail!("Binary 2DA row count exceeds the available data");
+        }
+        if row_count.saturating_mul(columns.len()) > MAX_CELLS {
+            bail!("Binary 2DA expands to too many cells");
+        }
         let mut row_headers = Vec::with_capacity(row_count);
         for _ in 0..row_count {
             row_headers.push(read_tab_string(&mut cursor)?);
@@ -197,6 +221,9 @@ impl TwoDaFile {
         if columns.len() < 2 {
             bail!("The 2DA file has no data columns");
         }
+        if columns.len() - 1 > MAX_COLUMNS {
+            bail!("2DA contains too many columns");
+        }
         let mut rows = Vec::new();
         for (line_no, line) in lines.enumerate() {
             let row = tokenize(line).with_context(|| format!("Invalid 2DA row {}", line_no + 1))?;
@@ -207,6 +234,9 @@ impl TwoDaFile {
                     row.len(),
                     columns.len()
                 );
+            }
+            if rows.len() >= MAX_ROWS || rows.len().saturating_add(1) * columns.len() > MAX_CELLS {
+                bail!("2DA contains too many rows");
             }
             rows.push(row);
         }
@@ -383,5 +413,9 @@ mod tests {
         let mut table = TwoDaFile::parse("2DA V2.0\n\nLabel\n0 ok\n").unwrap();
         table.rows[0][1] = "cannot \" round trip".into();
         assert!(table.to_text().is_err());
+
+        let mut impossible_rows = b"2DA V2.b\nLabel\t\0".to_vec();
+        impossible_rows.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(TwoDaFile::parse_binary(&impossible_rows).is_err());
     }
 }

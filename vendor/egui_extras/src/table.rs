@@ -879,7 +879,10 @@ impl Table<'_> {
             }
         });
 
-        let bottom = ui.min_rect().bottom();
+        // Column resize separators belong only to this table. Using the parent
+        // UI's minimum rect can extend them through widgets rendered after the
+        // table (such as the TLK full-text editor).
+        let bottom = scroll_area_out.inner_rect.bottom() - ui.spacing().scroll.allocated_width();
 
         let spacing_x = ui.spacing().item_spacing.x;
         // Column separators are painted outside the scrolled child UI, so
@@ -950,16 +953,22 @@ impl Table<'_> {
                     && ui.ctx().pointer_latest_pos().is_some_and(|pointer| {
                         pointer.x >= cursor_position.x + viewport_width - scroll_bar_hit_width
                     });
-                let resize_response = if line_rect.is_positive() && !pointer_over_vertical_bar {
-                    ui.interact(line_rect, column_resize_id, egui::Sense::click_and_drag())
-                } else {
-                    ui.allocate_response(Vec2::ZERO, egui::Sense::hover())
-                };
+                // Middle-button panning belongs to the table content. Do not let a
+                // column separator capture that gesture as a resize drag.
+                let middle_button_down =
+                    ui.input(|input| input.pointer.button_down(egui::PointerButton::Middle));
+                let resize_response =
+                    if line_rect.is_positive() && !pointer_over_vertical_bar && !middle_button_down
+                    {
+                        ui.interact(line_rect, column_resize_id, egui::Sense::click_and_drag())
+                    } else {
+                        ui.allocate_response(Vec2::ZERO, egui::Sense::hover())
+                    };
 
                 if column.auto_size_this_frame {
                     // Auto-size: resize to what is needed.
                     *column_width = width_range.clamp(max_used_widths[i]);
-                } else if resize_response.dragged()
+                } else if resize_response.dragged_by(egui::PointerButton::Primary)
                     && let Some(pointer) = ui.ctx().pointer_latest_pos()
                 {
                     let mut new_width = *column_width + pointer.x - x;
@@ -986,11 +995,11 @@ impl Table<'_> {
                     ui.input(|i| i.pointer.any_down() || i.pointer.any_pressed());
                 let resize_hover = resize_response.hovered() && !dragging_something_else;
 
-                if resize_hover || resize_response.dragged() {
+                if resize_hover || resize_response.dragged_by(egui::PointerButton::Primary) {
                     ui.set_cursor_icon(egui::CursorIcon::ResizeColumn);
                 }
 
-                let stroke = if resize_response.dragged() {
+                let stroke = if resize_response.dragged_by(egui::PointerButton::Primary) {
                     ui.style().visuals.widgets.active.bg_stroke
                 } else if resize_hover {
                     ui.style().visuals.widgets.hovered.bg_stroke

@@ -6,5 +6,6 @@ Exec=aurora-tlk-explorer %F
 Icon=aurora-tlk-explorer
 Categories=Development;
 Terminal=false
+StartupNotify=true
 MimeType=application/x-nwn-tlk;application/x-nwn-2da;
 StartupWMClass=org.aurora_tools.AuroraTlkExplorer

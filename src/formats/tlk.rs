@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use encoding_rs::{BIG5, EUC_KR, GBK, SHIFT_JIS, WINDOWS_1250, WINDOWS_1252};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path};
+use std::path::Path;
 
 const MAGIC: &[u8; 8] = b"TLK V3.0";
 const HEADER_SIZE: usize = 20;
@@ -127,12 +127,14 @@ fn encode(text: &str, encoding: TlkEncoding) -> Result<Vec<u8>> {
 }
 
 fn likely_encoding(language_id: u32, strings: &[&[u8]]) -> TlkEncoding {
-    let non_ascii: Vec<u8> = strings
+    let has_non_ascii = strings
         .iter()
-        .flat_map(|s| s.iter().copied())
-        .filter(|byte| !byte.is_ascii())
-        .collect();
-    if !non_ascii.is_empty() && std::str::from_utf8(&non_ascii).is_ok() {
+        .any(|value| value.iter().any(|byte| !byte.is_ascii()));
+    if has_non_ascii
+        && strings
+            .iter()
+            .all(|value| std::str::from_utf8(value).is_ok())
+    {
         return TlkEncoding::Utf8;
     }
     match language_id {
@@ -147,7 +149,7 @@ fn likely_encoding(language_id: u32, strings: &[&[u8]]) -> TlkEncoding {
 
 impl TlkFile {
     pub fn read(path: &Path) -> Result<Self> {
-        let data = fs::read(path).with_context(|| format!("Could not read {}", path.display()))?;
+        let data = super::read_file_limited(path, "TLK file")?;
         Self::from_bytes(&data)
     }
 
@@ -304,7 +306,7 @@ impl TlkFile {
     }
 
     pub fn read_diff(path: &Path) -> Result<Vec<(usize, TlkEntry)>> {
-        let data = fs::read(path)?;
+        let data = super::read_file_limited(path, "TLK diff")?;
         let mut cursor = 0;
         let read_u32 = |cursor: &mut usize| -> Result<u32> {
             let bytes: [u8; 4] = data
@@ -352,7 +354,7 @@ impl TlkFile {
     }
 
     pub fn read_dtu(path: &Path) -> Result<Vec<(usize, TlkEntry)>> {
-        let data = fs::read(path)?;
+        let data = super::read_file_limited(path, "DTU file")?;
         let mut cursor = 0;
         let read_le_u32 = |cursor: &mut usize| -> Result<u32> {
             let bytes: [u8; 4] = data
@@ -417,6 +419,7 @@ impl TlkFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]

@@ -6,6 +6,13 @@ use crate::formats::{
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_DOCUMENT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_document_id() -> u64 {
+    NEXT_DOCUMENT_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Clone, Debug)]
 pub enum DocumentData {
@@ -57,6 +64,89 @@ pub enum EditAction {
 }
 
 impl EditAction {
+    fn estimated_bytes(&self) -> usize {
+        fn string_bytes(value: &String) -> usize {
+            std::mem::size_of::<String>() + value.capacity()
+        }
+        fn entry_bytes(entry: &TlkEntry) -> usize {
+            std::mem::size_of::<TlkEntry>() + entry.sound_resref.capacity() + entry.text.capacity()
+        }
+        fn table_bytes(table: &TwoDaFile) -> usize {
+            std::mem::size_of::<TwoDaFile>()
+                + table.columns.iter().map(string_bytes).sum::<usize>()
+                + table
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        std::mem::size_of::<Vec<String>>()
+                            + row.iter().map(string_bytes).sum::<usize>()
+                    })
+                    .sum::<usize>()
+                + table.default_value.as_ref().map_or(0, string_bytes)
+        }
+        fn json_bytes(value: &serde_json::Value) -> usize {
+            use serde_json::Value;
+            match value {
+                Value::Null | Value::Bool(_) | Value::Number(_) => std::mem::size_of::<Value>(),
+                Value::String(value) => std::mem::size_of::<Value>() + value.capacity(),
+                Value::Array(values) => {
+                    std::mem::size_of::<Value>() + values.iter().map(json_bytes).sum::<usize>()
+                }
+                Value::Object(values) => {
+                    std::mem::size_of::<Value>()
+                        + values
+                            .iter()
+                            .map(|(key, value)| key.capacity() + json_bytes(value))
+                            .sum::<usize>()
+                }
+            }
+        }
+
+        match self {
+            Self::Batch(actions) => {
+                std::mem::size_of::<Self>()
+                    + actions.iter().map(Self::estimated_bytes).sum::<usize>()
+            }
+            Self::ItpTree { before, after } => {
+                std::mem::size_of::<Self>() + json_bytes(&before.root) + json_bytes(&after.root)
+            }
+            Self::TlkEntry { before, after, .. } => {
+                std::mem::size_of::<Self>() + entry_bytes(before) + entry_bytes(after)
+            }
+            Self::TlkRows {
+                removed, inserted, ..
+            } => {
+                std::mem::size_of::<Self>()
+                    + removed.iter().map(entry_bytes).sum::<usize>()
+                    + inserted.iter().map(entry_bytes).sum::<usize>()
+            }
+            Self::TlkSettings { .. } => std::mem::size_of::<Self>(),
+            Self::TwoDaDefault { before, after } => {
+                std::mem::size_of::<Self>()
+                    + before.as_ref().map_or(0, string_bytes)
+                    + after.as_ref().map_or(0, string_bytes)
+            }
+            Self::TwoDaCell { before, after, .. } => {
+                std::mem::size_of::<Self>() + string_bytes(before) + string_bytes(after)
+            }
+            Self::TwoDaRows {
+                removed, inserted, ..
+            } => {
+                let rows = removed.iter().chain(inserted);
+                std::mem::size_of::<Self>()
+                    + rows
+                        .map(|row| {
+                            std::mem::size_of::<Vec<String>>()
+                                + row.iter().map(string_bytes).sum::<usize>()
+                        })
+                        .sum::<usize>()
+            }
+            Self::TwoDaTable { before, after } => {
+                std::mem::size_of::<Self>() + table_bytes(before) + table_bytes(after)
+            }
+        }
+    }
+
     fn apply(&self, data: &mut DocumentData, forward: bool) {
         if let Self::Batch(actions) = self {
             if forward {
@@ -187,36 +277,57 @@ impl EditAction {
 #[derive(Clone, Debug, Default)]
 pub struct EditHistory {
     actions: Vec<EditAction>,
+    action_bytes: Vec<usize>,
+    total_bytes: usize,
     cursor: usize,
     saved_cursor: Option<usize>,
+    revision: u64,
 }
 
 impl EditHistory {
     const MAX_ACTIONS: usize = 512;
+    const MAX_BYTES: usize = 256 * 1024 * 1024;
 
     pub fn new_saved() -> Self {
         Self {
             actions: Vec::new(),
+            action_bytes: Vec::new(),
+            total_bytes: 0,
             cursor: 0,
             saved_cursor: Some(0),
+            revision: 0,
         }
     }
 
     pub fn record(&mut self, action: EditAction) {
+        self.revision = self.revision.wrapping_add(1);
+        let discarded = self.action_bytes[self.cursor..].iter().sum::<usize>();
+        self.total_bytes = self.total_bytes.saturating_sub(discarded);
         self.actions.truncate(self.cursor);
+        self.action_bytes.truncate(self.cursor);
         let can_merge = self.cursor > 0 && self.saved_cursor != Some(self.cursor);
         if can_merge && self.actions[self.cursor - 1].merge(&action) {
+            let old_size = self.action_bytes[self.cursor - 1];
+            let new_size = self.actions[self.cursor - 1].estimated_bytes();
+            self.action_bytes[self.cursor - 1] = new_size;
+            self.total_bytes = self
+                .total_bytes
+                .saturating_sub(old_size)
+                .saturating_add(new_size);
             return;
         }
+        let action_bytes = action.estimated_bytes();
         self.actions.push(action);
+        self.action_bytes.push(action_bytes);
+        self.total_bytes = self.total_bytes.saturating_add(action_bytes);
         self.cursor += 1;
-        if self.actions.len() > Self::MAX_ACTIONS {
-            let remove = self.actions.len() - Self::MAX_ACTIONS;
-            self.actions.drain(..remove);
-            self.cursor = self.cursor.saturating_sub(remove);
-            self.saved_cursor = self
-                .saved_cursor
-                .and_then(|cursor| cursor.checked_sub(remove));
+        while (self.actions.len() > Self::MAX_ACTIONS || self.total_bytes > Self::MAX_BYTES)
+            && self.actions.len() > 1
+        {
+            self.actions.remove(0);
+            self.total_bytes = self.total_bytes.saturating_sub(self.action_bytes.remove(0));
+            self.cursor = self.cursor.saturating_sub(1);
+            self.saved_cursor = self.saved_cursor.and_then(|cursor| cursor.checked_sub(1));
         }
     }
 
@@ -226,6 +337,7 @@ impl EditHistory {
         }
         self.cursor -= 1;
         self.actions[self.cursor].apply(data, false);
+        self.revision = self.revision.wrapping_add(1);
         true
     }
 
@@ -235,6 +347,7 @@ impl EditHistory {
         }
         self.actions[self.cursor].apply(data, true);
         self.cursor += 1;
+        self.revision = self.revision.wrapping_add(1);
         true
     }
 
@@ -250,10 +363,14 @@ impl EditHistory {
     pub fn is_clean(&self) -> bool {
         self.saved_cursor == Some(self.cursor)
     }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct Document {
+    pub id: u64,
     pub path: Option<PathBuf>,
     pub data: DocumentData,
     pub dirty: bool,
@@ -292,6 +409,7 @@ impl Document {
             bail!("Aurora currently opens .tlk, .2da, and .itp files");
         };
         Ok(Self {
+            id: next_document_id(),
             path: Some(path.to_path_buf()),
             data,
             dirty: false,
@@ -316,6 +434,7 @@ impl Document {
 
     pub fn new_tlk() -> Self {
         Self {
+            id: next_document_id(),
             path: None,
             data: DocumentData::Tlk(TlkFile::default()),
             dirty: true,
@@ -340,6 +459,7 @@ impl Document {
 
     pub fn new_twoda() -> Self {
         Self {
+            id: next_document_id(),
             path: None,
             data: DocumentData::TwoDa(TwoDaFile {
                 default_value: None,

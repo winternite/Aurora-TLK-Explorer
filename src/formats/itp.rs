@@ -1,4 +1,4 @@
-use super::{atomic_write, unique_temp_path};
+use super::{atomic_write, cleanup_stale_temp_files, unique_temp_path};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::{
@@ -8,6 +8,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+const MAX_CONVERTER_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_CONVERTER_ERROR_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ItpFile {
@@ -50,39 +53,59 @@ fn run_converter(mut command: Command, input: Option<&[u8]>) -> Result<Output> {
     let mut child = command
         .spawn()
         .with_context(|| "Could not start bundled NWN GFF converter")?;
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .context("Could not capture converter output")?;
-    let mut stderr = child
+    let stderr = child
         .stderr
         .take()
         .context("Could not capture converter errors")?;
-    let stdout_reader = thread::spawn(move || {
+    let stdout_reader = thread::spawn(move || -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).map(|_| bytes)
+        stdout
+            .take(MAX_CONVERTER_OUTPUT_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_CONVERTER_OUTPUT_BYTES {
+            bail!("NWN GFF converter output exceeds the 64 MiB safety limit");
+        }
+        Ok(bytes)
     });
-    let stderr_reader = thread::spawn(move || {
+    let stderr_reader = thread::spawn(move || -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).map(|_| bytes)
+        stderr
+            .take(MAX_CONVERTER_ERROR_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_CONVERTER_ERROR_BYTES {
+            bail!("NWN GFF converter error output exceeds the 8 MiB safety limit");
+        }
+        Ok(bytes)
     });
     if let Some(bytes) = input {
-        child
+        let write_result = child
             .stdin
             .take()
             .context("Could not open converter input")?
-            .write_all(bytes)?;
+            .write_all(bytes);
+        if let Err(error) = write_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(error).context("Could not send data to the NWN GFF converter");
+        }
     }
 
     let deadline = Instant::now() + Duration::from_secs(60);
+    let mut timed_out = false;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
         if Instant::now() >= deadline {
+            timed_out = true;
             let _ = child.kill();
-            let _ = child.wait();
-            bail!("NWN GFF converter timed out after 60 seconds");
+            break child.wait()?;
         }
         thread::sleep(Duration::from_millis(20));
     };
@@ -92,6 +115,9 @@ fn run_converter(mut command: Command, input: Option<&[u8]>) -> Result<Output> {
     let stderr = stderr_reader
         .join()
         .map_err(|_| anyhow::anyhow!("Converter error reader failed"))??;
+    if timed_out {
+        bail!("NWN GFF converter timed out after 60 seconds");
+    }
     Ok(Output {
         status,
         stdout,
@@ -194,6 +220,8 @@ impl ItpFile {
     }
 
     pub fn read(path: &Path) -> Result<Self> {
+        cleanup_stale_temp_files(path);
+        super::ensure_file_size(path, "ITP file")?;
         let mut command = Command::new(converter());
         command.args([
             "-i",
@@ -219,6 +247,7 @@ impl ItpFile {
 
     pub fn write(&self, path: &Path) -> Result<()> {
         self.validate()?;
+        cleanup_stale_temp_files(path);
         let encoded = unique_temp_path(path).with_extension("itp.aurora-encoded");
         let mut command = Command::new(converter());
         command.args([
@@ -232,16 +261,18 @@ impl ItpFile {
             "UTF-8",
         ]);
         let json = serde_json::to_vec(&self.root)?;
-        let output = run_converter(command, Some(&json))?;
-        if !output.status.success() {
-            let _ = std::fs::remove_file(&encoded);
-            bail!(
-                "Could not encode ITP: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        let bytes = std::fs::read(&encoded)?;
-        let _ = std::fs::remove_file(encoded);
+        let converted = (|| -> Result<Vec<u8>> {
+            let output = run_converter(command, Some(&json))?;
+            if !output.status.success() {
+                bail!(
+                    "Could not encode ITP: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            super::read_file_limited(&encoded, "encoded ITP file")
+        })();
+        let _ = std::fs::remove_file(&encoded);
+        let bytes = converted?;
         atomic_write(path, &bytes)
     }
 }

@@ -26,6 +26,7 @@ impl ThemeChoice {
 pub struct PersistentState {
     pub theme: ThemeChoice,
     pub open_files: Vec<PathBuf>,
+    pub recent_files: Vec<PathBuf>,
     pub active_file: Option<PathBuf>,
     pub last_directory: Option<PathBuf>,
     pub display_user_strref: bool,
@@ -37,9 +38,10 @@ impl Default for PersistentState {
         Self {
             theme: ThemeChoice::System,
             open_files: Vec::new(),
+            recent_files: Vec::new(),
             active_file: None,
             last_directory: None,
-            display_user_strref: false,
+            display_user_strref: true,
             display_hex_strref: false,
         }
     }

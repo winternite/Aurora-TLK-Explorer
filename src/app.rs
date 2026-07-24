@@ -7,12 +7,17 @@ use eframe::egui::{self, Align, Align2, Color32, Id, Layout, RichText, TextEdit,
 use egui_extras::{Column, TableBuilder};
 use rfd::FileDialog;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, TryRecvError},
 };
 
 const APP_NAME: &str = "Aurora TLK Explorer";
+const MAX_CONCURRENT_OPENS: usize = 4;
+const MAX_CONCURRENT_SAVES: usize = 2;
+const MAX_QUEUED_OPENS: usize = 32;
+const MAX_QUEUED_SAVES: usize = 8;
+const MAX_RECENT_FILES: usize = 8;
 
 #[derive(Clone, Copy)]
 struct PendingClose {
@@ -59,6 +64,12 @@ enum CloseChoice {
     Cancel,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaveOutcome {
+    Started,
+    Cancelled,
+}
+
 #[derive(Clone)]
 enum ClipboardRows {
     Tlk(Vec<(usize, TlkEntry)>),
@@ -70,6 +81,26 @@ struct ColumnDialogState {
     index: String,
     name: String,
     default_value: String,
+}
+
+struct RowInsertDialogState {
+    document_id: u64,
+    window_id: Id,
+    count: usize,
+    below: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct MiddleMouseScrollState {
+    active: bool,
+    anchor: egui::Pos2,
+}
+
+struct TableScrollBounds {
+    viewport: egui::Rect,
+    row_count: usize,
+    visible_rows: usize,
+    content_width: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -87,9 +118,9 @@ enum SearchAction {
     ReplaceAll,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum RowMenuAction {
-    Delete,
+    Delete(Vec<usize>),
     InsertAbove(usize),
     InsertBelow(usize),
 }
@@ -100,28 +131,73 @@ struct PendingOpen {
     receiver: Receiver<anyhow::Result<Document>>,
 }
 
+struct QueuedOpen {
+    path: PathBuf,
+    report_errors: bool,
+}
+
+struct SaveJob {
+    document_id: u64,
+    revision: u64,
+    path: PathBuf,
+    title: String,
+    data: DocumentData,
+    close_after: Option<PendingClose>,
+}
+
+struct PendingSave {
+    document_id: u64,
+    revision: u64,
+    path: PathBuf,
+    title: String,
+    close_after: Option<PendingClose>,
+    receiver: Receiver<anyhow::Result<()>>,
+}
+
 pub struct AuroraApp {
     documents: Vec<Document>,
     active: Option<usize>,
     state: PersistentState,
     pending_close: Option<PendingClose>,
     allow_exit: bool,
+    quit_after_saves: bool,
     message: Option<(String, bool)>,
     clipboard: Option<ClipboardRows>,
     clipboard_text: Option<String>,
     pending_paste_text: Option<String>,
     resize_value: Option<String>,
     column_dialog: Option<ColumnDialogState>,
+    row_insert_dialog: Option<RowInsertDialogState>,
     show_diff_overview: bool,
     search_window_open: bool,
     focus_search_window: bool,
     pending_opens: Vec<PendingOpen>,
+    queued_opens: VecDeque<QueuedOpen>,
+    pending_saves: Vec<PendingSave>,
+    queued_saves: VecDeque<SaveJob>,
     restore_active_file: Option<PathBuf>,
+    last_window_title: Option<String>,
+    incoming_paths: Option<Receiver<Vec<PathBuf>>>,
 }
 
 impl AuroraApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let state = PersistentState::load();
+    pub fn new(cc: &eframe::CreationContext<'_>, incoming_paths: Receiver<Vec<PathBuf>>) -> Self {
+        // The single-instance listener receives requests on a background thread. Bridge them
+        // to the UI queue and explicitly wake egui, otherwise an idle window would not poll the
+        // request until the user next clicked it.
+        let (ui_sender, ui_receiver) = mpsc::sync_channel(MAX_QUEUED_OPENS);
+        let wake_context = cc.egui_ctx.clone();
+        std::thread::spawn(move || {
+            while let Ok(paths) = incoming_paths.recv() {
+                if ui_sender.send(paths).is_err() {
+                    break;
+                }
+                wake_context.request_repaint();
+            }
+        });
+        let mut state = PersistentState::load();
+        state.recent_files.retain(|path| path.is_file());
+        state.recent_files.truncate(MAX_RECENT_FILES);
         let restore_active_file = state.active_file.clone();
         Self::apply_theme(&cc.egui_ctx, state.theme);
         let mut app = Self {
@@ -130,17 +206,24 @@ impl AuroraApp {
             state,
             pending_close: None,
             allow_exit: false,
+            quit_after_saves: false,
             message: None,
             clipboard: None,
             clipboard_text: None,
             pending_paste_text: None,
             resize_value: None,
             column_dialog: None,
+            row_insert_dialog: None,
             show_diff_overview: false,
             search_window_open: false,
             focus_search_window: false,
             pending_opens: Vec::new(),
+            queued_opens: VecDeque::new(),
+            pending_saves: Vec::new(),
+            queued_saves: VecDeque::new(),
             restore_active_file,
+            last_window_title: None,
+            incoming_paths: Some(ui_receiver),
         };
 
         let startup_files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
@@ -151,6 +234,34 @@ impl AuroraApp {
             }
         }
         app
+    }
+
+    fn poll_external_open_requests(&mut self, ctx: &egui::Context) {
+        let mut disconnected = false;
+        let mut requests = Vec::new();
+        if let Some(receiver) = &self.incoming_paths {
+            loop {
+                match receiver.try_recv() {
+                    Ok(paths) => requests.push(paths),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if disconnected {
+            self.incoming_paths = None;
+        }
+        for paths in requests {
+            for path in paths {
+                if path.is_file() {
+                    self.open_path(&path, true);
+                }
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
     }
 
     fn apply_theme(ctx: &egui::Context, theme: ThemeChoice) {
@@ -181,11 +292,27 @@ impl AuroraApp {
             style.visuals.selection.bg_fill = Color32::from_rgb(178, 205, 226);
             style.visuals.selection.stroke = egui::Stroke::new(1.0, Color32::from_rgb(30, 45, 56));
             style.visuals.extreme_bg_color = Color32::from_rgb(250, 252, 254);
+            // The stock light-theme greys were too low-contrast for dense data tables.
+            // Keep helper text visually secondary, but comfortably readable.
+            style.visuals.override_text_color = Some(Color32::from_rgb(38, 44, 49));
+            style.visuals.weak_text_color = Some(Color32::from_rgb(92, 98, 104));
         });
     }
 
     fn set_message(&mut self, text: impl Into<String>, error: bool) {
         self.message = Some((text.into(), error));
+    }
+
+    fn remember_recent_file(&mut self, path: &Path) {
+        Self::update_recent_files(&mut self.state.recent_files, path);
+    }
+
+    fn update_recent_files(recent_files: &mut Vec<PathBuf>, path: &Path) {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        recent_files
+            .retain(|recent| recent.canonicalize().unwrap_or_else(|_| recent.clone()) != canonical);
+        recent_files.insert(0, canonical);
+        recent_files.truncate(MAX_RECENT_FILES);
     }
 
     fn sync_state(&mut self) {
@@ -198,6 +325,7 @@ impl AuroraApp {
                     .iter()
                     .map(|pending| pending.path.clone()),
             )
+            .chain(self.queued_opens.iter().map(|queued| queued.path.clone()))
             .collect();
         self.state.active_file = self
             .active
@@ -221,37 +349,71 @@ impl AuroraApp {
             .pending_opens
             .iter()
             .any(|pending| pending.path == canonical)
+            || self
+                .queued_opens
+                .iter()
+                .any(|queued| queued.path == canonical)
         {
             return;
         }
+        if self.pending_opens.len() >= MAX_CONCURRENT_OPENS {
+            if self.queued_opens.len() >= MAX_QUEUED_OPENS {
+                self.set_message("Too many files are waiting to open", true);
+                return;
+            }
+            self.queued_opens.push_back(QueuedOpen {
+                path: canonical,
+                report_errors,
+            });
+            return;
+        }
+        self.start_open_worker(canonical, report_errors);
+    }
+
+    fn start_open_worker(&mut self, path: PathBuf, report_errors: bool) {
         let (sender, receiver) = mpsc::channel();
-        let worker_path = canonical.clone();
+        let worker_path = path.clone();
         std::thread::spawn(move || {
             let _ = sender.send(Document::open(&worker_path));
         });
         self.pending_opens.push(PendingOpen {
-            path: canonical,
+            path,
             report_errors,
             receiver,
         });
     }
 
-    fn poll_open_jobs(&mut self) {
-        while let Some(pending) = self.pending_opens.first() {
-            let result = match pending.receiver.try_recv() {
-                Ok(result) => Some(result),
-                Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => Some(Err(anyhow::anyhow!(
-                    "The file-loading worker stopped unexpectedly"
-                ))),
-            };
-            let Some(result) = result else {
+    fn fill_open_workers(&mut self) {
+        while self.pending_opens.len() < MAX_CONCURRENT_OPENS {
+            let Some(queued) = self.queued_opens.pop_front() else {
                 break;
             };
-            let pending = self.pending_opens.remove(0);
+            self.start_open_worker(queued.path, queued.report_errors);
+        }
+    }
+
+    fn poll_open_jobs(&mut self, ctx: &egui::Context) {
+        let mut completed = Vec::new();
+        for (index, pending) in self.pending_opens.iter().enumerate() {
+            match pending.receiver.try_recv() {
+                Ok(result) => completed.push((index, result)),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => completed.push((
+                    index,
+                    Err(anyhow::anyhow!(
+                        "The file-loading worker stopped unexpectedly"
+                    )),
+                )),
+            }
+        }
+        for (index, result) in completed.into_iter().rev() {
+            let pending = self.pending_opens.remove(index);
             match result {
                 Ok(document) => {
                     self.state.last_directory = pending.path.parent().map(Path::to_path_buf);
+                    if pending.report_errors {
+                        self.remember_recent_file(&pending.path);
+                    }
                     self.documents.push(document);
                     let opened = self.documents.len() - 1;
                     let wanted = self.restore_active_file.as_ref() == Some(&pending.path);
@@ -272,6 +434,108 @@ impl AuroraApp {
                 }
             }
         }
+        self.fill_open_workers();
+        if self.quit_after_saves
+            && self.pending_opens.is_empty()
+            && self.queued_opens.is_empty()
+            && self.pending_saves.is_empty()
+            && self.queued_saves.is_empty()
+        {
+            self.quit_after_saves = false;
+            self.request_quit(ctx);
+        }
+    }
+
+    fn poll_save_jobs(&mut self, ctx: &egui::Context) {
+        let mut completed = Vec::new();
+        for (index, pending) in self.pending_saves.iter().enumerate() {
+            match pending.receiver.try_recv() {
+                Ok(result) => completed.push((index, result)),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => completed.push((
+                    index,
+                    Err(anyhow::anyhow!(
+                        "The file-saving worker stopped unexpectedly"
+                    )),
+                )),
+            }
+        }
+        for (index, result) in completed.into_iter().rev() {
+            let pending = self.pending_saves.remove(index);
+            let document_index = self
+                .documents
+                .iter()
+                .position(|document| document.id == pending.document_id);
+            match result {
+                Ok(()) => {
+                    let unchanged = document_index.is_some_and(|index| {
+                        self.documents[index].history.revision() == pending.revision
+                    });
+                    if let Some(index) = document_index {
+                        self.documents[index].path = Some(pending.path.clone());
+                        if unchanged {
+                            self.documents[index].history.mark_saved();
+                            self.documents[index].dirty = false;
+                        }
+                    }
+                    if unchanged {
+                        self.set_message(format!("Saved {}", pending.path.display()), false);
+                    } else if document_index.is_some() {
+                        self.set_message(
+                            format!(
+                                "Saved {}; newer edits remain unsaved",
+                                pending.path.display()
+                            ),
+                            false,
+                        );
+                    } else {
+                        self.set_message(format!("Saved {}", pending.path.display()), false);
+                    }
+
+                    if let Some(close_after) = pending.close_after {
+                        if let Some(index) = document_index {
+                            if unchanged {
+                                if close_after.quitting {
+                                    self.request_quit(ctx);
+                                } else {
+                                    self.remove_document(index);
+                                }
+                            } else {
+                                self.active = Some(index);
+                                self.pending_close = Some(PendingClose {
+                                    index,
+                                    quitting: close_after.quitting,
+                                });
+                            }
+                        } else if close_after.quitting {
+                            self.request_quit(ctx);
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.set_message(format!("Could not save {}: {error:#}", pending.title), true);
+                    if let (Some(close_after), Some(index)) = (pending.close_after, document_index)
+                    {
+                        self.active = Some(index);
+                        self.pending_close = Some(PendingClose {
+                            index,
+                            quitting: close_after.quitting,
+                        });
+                    }
+                }
+            }
+            self.sync_state();
+        }
+        self.fill_save_workers();
+        if self.quit_after_saves
+            && self.pending_saves.is_empty()
+            && self.queued_saves.is_empty()
+            && self.pending_opens.is_empty()
+            && self.queued_opens.is_empty()
+        {
+            self.quit_after_saves = false;
+            self.request_quit(ctx);
+        }
     }
 
     fn open_dialog(&mut self) {
@@ -291,11 +555,100 @@ impl AuroraApp {
         }
     }
 
-    fn save_document(&mut self, index: usize, force_as: bool) -> bool {
-        if index >= self.documents.len() {
-            return false;
+    fn save_is_pending(&self, document_id: u64) -> bool {
+        self.pending_saves
+            .iter()
+            .any(|pending| pending.document_id == document_id)
+            || self
+                .queued_saves
+                .iter()
+                .any(|queued| queued.document_id == document_id)
+    }
+
+    fn attach_save_continuation(&mut self, document_id: u64, close_after: PendingClose) {
+        if let Some(pending) = self
+            .pending_saves
+            .iter_mut()
+            .find(|pending| pending.document_id == document_id)
+        {
+            pending.close_after = Some(close_after);
+        } else if let Some(queued) = self
+            .queued_saves
+            .iter_mut()
+            .find(|queued| queued.document_id == document_id)
+        {
+            queued.close_after = Some(close_after);
         }
-        if force_as || self.documents[index].path.is_none() {
+    }
+
+    fn start_save_worker(&mut self, job: SaveJob) {
+        let SaveJob {
+            document_id,
+            revision,
+            path,
+            title,
+            data,
+            close_after,
+        } = job;
+        let worker_path = path.clone();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = match data {
+                DocumentData::Tlk(file) => file.write(&worker_path),
+                DocumentData::TwoDa(file) => file.write(&worker_path),
+                DocumentData::Itp(file) => file.write(&worker_path),
+            };
+            let _ = sender.send(result);
+        });
+        self.pending_saves.push(PendingSave {
+            document_id,
+            revision,
+            path,
+            title,
+            close_after,
+            receiver,
+        });
+    }
+
+    fn fill_save_workers(&mut self) {
+        while self.pending_saves.len() < MAX_CONCURRENT_SAVES {
+            let Some(job) = self.queued_saves.pop_front() else {
+                break;
+            };
+            self.start_save_worker(job);
+        }
+    }
+
+    fn queue_save(&mut self, job: SaveJob) -> bool {
+        if self.pending_saves.len() < MAX_CONCURRENT_SAVES {
+            self.start_save_worker(job);
+            true
+        } else if self.queued_saves.len() < MAX_QUEUED_SAVES {
+            self.queued_saves.push_back(job);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn save_document(
+        &mut self,
+        index: usize,
+        force_as: bool,
+        close_after: Option<PendingClose>,
+    ) -> SaveOutcome {
+        if index >= self.documents.len() {
+            return SaveOutcome::Cancelled;
+        }
+        let document_id = self.documents[index].id;
+        if self.save_is_pending(document_id) {
+            if let Some(close_after) = close_after {
+                self.attach_save_continuation(document_id, close_after);
+            }
+            self.set_message("That document is already being saved", false);
+            return SaveOutcome::Started;
+        }
+        let path = if force_as || self.documents[index].path.is_none() {
             let ext = self.documents[index].default_extension();
             let mut dialog = FileDialog::new()
                 .set_title("Save document")
@@ -305,27 +658,33 @@ impl AuroraApp {
                 dialog = dialog.set_directory(dir);
             }
             let Some(mut path) = dialog.save_file() else {
-                return false;
+                return SaveOutcome::Cancelled;
             };
             if path.extension().is_none() {
                 path.set_extension(ext);
             }
             self.state.last_directory = path.parent().map(Path::to_path_buf);
-            if let Err(error) = self.documents[index].save_as(path.clone()) {
-                self.set_message(format!("Save failed: {error:#}"), true);
-                return false;
-            }
-            self.set_message(format!("Saved {}", path.display()), false);
+            path
         } else {
-            let title = self.documents[index].title();
-            if let Err(error) = self.documents[index].save() {
-                self.set_message(format!("Save failed: {error:#}"), true);
-                return false;
-            }
-            self.set_message(format!("Saved {title}"), false);
+            self.documents[index]
+                .path
+                .clone()
+                .expect("a named document must have a path")
+        };
+        let job = SaveJob {
+            document_id,
+            revision: self.documents[index].history.revision(),
+            path: path.clone(),
+            title: self.documents[index].title(),
+            data: self.documents[index].data.clone(),
+            close_after,
+        };
+        if !self.queue_save(job) {
+            self.set_message("Too many documents are waiting to save", true);
+            return SaveOutcome::Cancelled;
         }
-        self.sync_state();
-        true
+        self.set_message(format!("Saving {}…", path.display()), false);
+        SaveOutcome::Started
     }
 
     fn remove_document(&mut self, index: usize) {
@@ -510,9 +869,15 @@ impl AuroraApp {
     fn row_action_context_menu(
         response: &egui::Response,
         row: usize,
-        selected_count: usize,
+        selected_rows: Vec<usize>,
         action: &mut Option<RowMenuAction>,
     ) {
+        let rows_to_delete = if selected_rows.contains(&row) {
+            selected_rows
+        } else {
+            vec![row]
+        };
+        let delete_label = format!("Delete selected rows ({})", rows_to_delete.len());
         response.context_menu(|ui| {
             if ui.button("Add row above").clicked() {
                 *action = Some(RowMenuAction::InsertAbove(row));
@@ -523,15 +888,8 @@ impl AuroraApp {
                 ui.close();
             }
             ui.separator();
-            if ui
-                .button(if selected_count == 1 {
-                    "Delete selected row".to_owned()
-                } else {
-                    format!("Delete {selected_count} selected rows")
-                })
-                .clicked()
-            {
-                *action = Some(RowMenuAction::Delete);
+            if ui.button(&delete_label).clicked() {
+                *action = Some(RowMenuAction::Delete(rows_to_delete.clone()));
                 ui.close();
             }
         });
@@ -685,11 +1043,24 @@ impl AuroraApp {
             }
         });
         if wheel_delta != 0.0 {
-            let rows = (wheel_delta.abs() / 12.0).ceil().max(1.0) as usize;
-            if wheel_delta < 0.0 {
-                *first_row = first_row.saturating_add(rows).min(max_first);
-            } else {
-                *first_row = first_row.saturating_sub(rows);
+            // Egui spreads a wheel turn across several frames. Accumulate its
+            // fractional row movement instead of forcing each small frame to
+            // a full row, which made the wheel scroll much too quickly.
+            let row_delta = ui.data_mut(|data| {
+                let remainder = data.get_temp_mut_or_default::<f32>(id.with("wheel_remainder"));
+                *remainder += wheel_delta / 24.0;
+                let whole_rows = remainder.trunc();
+                *remainder -= whole_rows;
+                whole_rows as isize
+            });
+            if row_delta != 0 {
+                if row_delta < 0 {
+                    *first_row = first_row
+                        .saturating_add(row_delta.unsigned_abs())
+                        .min(max_first);
+                } else {
+                    *first_row = first_row.saturating_sub(row_delta as usize);
+                }
             }
             ui.ctx().request_repaint();
         }
@@ -700,7 +1071,8 @@ impl AuroraApp {
         } else {
             track.height()
         };
-        if (response.dragged() || response.clicked())
+        if (response.dragged_by(egui::PointerButton::Primary)
+            || response.clicked_by(egui::PointerButton::Primary))
             && let Some(pointer) = response.interact_pointer_pos()
         {
             let travel = (track.height() - handle_height).max(1.0);
@@ -750,7 +1122,8 @@ impl AuroraApp {
         } else {
             track.width()
         };
-        if (response.dragged() || response.clicked())
+        if (response.dragged_by(egui::PointerButton::Primary)
+            || response.clicked_by(egui::PointerButton::Primary))
             && let Some(pointer) = response.interact_pointer_pos()
         {
             let travel = (track.width() - handle_width).max(1.0);
@@ -771,41 +1144,135 @@ impl AuroraApp {
         )
         .shrink(2.0);
         let visuals = ui.style().interact(&response);
+        // Opaque fill masks table column separators beneath this caller-owned
+        // horizontal scrollbar.
         ui.painter()
-            .rect_filled(track, 2.0, ui.visuals().extreme_bg_color);
+            .rect_filled(track, 2.0, ui.visuals().panel_fill);
         ui.painter().rect_filled(handle, 3.0, visuals.bg_fill);
         ui.painter()
             .rect_stroke(handle, 3.0, visuals.bg_stroke, egui::StrokeKind::Inside);
     }
 
-    fn middle_mouse_table_scroll(
+    fn sticky_twoda_index_column(
         ui: &mut egui::Ui,
         viewport: egui::Rect,
-        row_count: usize,
-        visible_rows: usize,
-        content_width: f32,
+        first_visible: usize,
+        visible: Option<&[usize]>,
+        window_count: usize,
+        selected_rows: &BTreeSet<usize>,
+        selected_cells: &BTreeSet<(usize, usize)>,
+    ) {
+        const INDEX_WIDTH: f32 = 70.0;
+        const HEADER_HEIGHT: f32 = 25.0;
+        const ROW_HEIGHT: f32 = 26.0;
+
+        // The table scrolls as one surface, so redraw this identifying column on
+        // top of it after the horizontal offset has been applied.
+        let header = egui::Rect::from_min_size(
+            egui::pos2(viewport.left(), viewport.top() - HEADER_HEIGHT),
+            egui::vec2(INDEX_WIDTH, HEADER_HEIGHT),
+        );
+        let column =
+            egui::Rect::from_min_max(header.min, egui::pos2(header.right(), viewport.bottom()));
+        let painter = ui.painter().with_clip_rect(column);
+        // This must be opaque: the horizontally scrolled cells sit underneath
+        // the rail and otherwise their text bleeds through.
+        painter.rect_filled(column, 0.0, ui.visuals().panel_fill);
+        painter.text(
+            header.center(),
+            Align2::CENTER_CENTER,
+            "Index",
+            egui::TextStyle::Body.resolve(ui.style()),
+            ui.visuals().strong_text_color(),
+        );
+
+        let row_step = ROW_HEIGHT + ui.spacing().item_spacing.y;
+        for offset in 0..window_count {
+            let row_index =
+                visible.map_or(first_visible + offset, |rows| rows[first_visible + offset]);
+            let selected = selected_rows.contains(&row_index)
+                || selected_cells.iter().any(|(row, _)| *row == row_index);
+            let row = egui::Rect::from_min_size(
+                egui::pos2(viewport.left(), viewport.top() + offset as f32 * row_step),
+                egui::vec2(INDEX_WIDTH, ROW_HEIGHT),
+            );
+            let fill = if selected {
+                ui.visuals().selection.bg_fill
+            } else {
+                ui.visuals().panel_fill
+            };
+            painter.rect_filled(row, 0.0, fill);
+            painter.text(
+                egui::pos2(row.left() + 4.0, row.center().y),
+                Align2::LEFT_CENTER,
+                row_index.to_string(),
+                egui::TextStyle::Body.resolve(ui.style()),
+                if selected {
+                    ui.visuals().selection.stroke.color
+                } else {
+                    ui.visuals().text_color()
+                },
+            );
+        }
+        painter.line_segment(
+            [
+                egui::pos2(column.right(), column.top()),
+                egui::pos2(column.right(), column.bottom()),
+            ],
+            ui.visuals().widgets.noninteractive.bg_stroke,
+        );
+    }
+
+    fn middle_mouse_table_scroll(
+        ui: &mut egui::Ui,
+        id: Id,
+        bounds: TableScrollBounds,
         first_row: &mut usize,
         horizontal_offset: &mut f32,
     ) {
-        let active = ui.input(|input| {
-            input.pointer.button_down(egui::PointerButton::Middle)
-                && input
-                    .pointer
-                    .hover_pos()
-                    .is_some_and(|pos| viewport.contains(pos))
+        let (pointer, middle_clicked, clicked_elsewhere) = ui.input(|input| {
+            (
+                input.pointer.hover_pos(),
+                input.pointer.button_clicked(egui::PointerButton::Middle),
+                input.pointer.button_clicked(egui::PointerButton::Primary)
+                    || input.pointer.button_clicked(egui::PointerButton::Secondary),
+            )
         });
-        if active {
-            let delta = ui.input(|input| input.pointer.delta());
-            let max_first = row_count.saturating_sub(visible_rows);
-            let vertical_rows = (delta.y.abs() * 0.75).round() as usize;
-            if delta.y > 0.0 {
-                *first_row = first_row.saturating_add(vertical_rows).min(max_first);
-            } else if delta.y < 0.0 {
-                *first_row = first_row.saturating_sub(vertical_rows);
+        let state = ui.data_mut(|data| {
+            let state = data.get_temp_mut_or_default::<MiddleMouseScrollState>(id);
+            if middle_clicked {
+                if state.active {
+                    state.active = false;
+                } else if let Some(pointer) = pointer.filter(|pos| bounds.viewport.contains(*pos)) {
+                    state.active = true;
+                    state.anchor = pointer;
+                }
+            } else if clicked_elsewhere {
+                state.active = false;
+            }
+            *state
+        });
+        if state.active {
+            let offset = pointer.map_or(egui::Vec2::ZERO, |pointer| pointer - state.anchor);
+            let max_first = bounds.row_count.saturating_sub(bounds.visible_rows);
+            // Browser-style auto-scroll: distance from the middle-click anchor
+            // controls speed, with a calm centre and progressive acceleration.
+            let row_delta = ui.data_mut(|data| {
+                let remainder = data.get_temp_mut_or_default::<f32>(id.with("row_remainder"));
+                *remainder += offset.y.signum() * 0.0015 * offset.y.abs().powf(1.3);
+                let whole_rows = remainder.trunc() as isize;
+                *remainder -= whole_rows as f32;
+                whole_rows
+            });
+            if row_delta > 0 {
+                *first_row = first_row.saturating_add(row_delta as usize).min(max_first);
+            } else if row_delta < 0 {
+                *first_row = first_row.saturating_sub(row_delta.unsigned_abs());
             }
 
-            let max_horizontal = (content_width - viewport.width()).max(0.0);
-            *horizontal_offset = (*horizontal_offset + delta.x * 3.0).clamp(0.0, max_horizontal);
+            let max_horizontal = (bounds.content_width - bounds.viewport.width()).max(0.0);
+            let horizontal_delta = offset.x.signum() * 0.035 * offset.x.abs().powf(1.15);
+            *horizontal_offset = (*horizontal_offset + horizontal_delta).clamp(0.0, max_horizontal);
             ui.ctx().set_cursor_icon(egui::CursorIcon::AllScroll);
             ui.ctx().request_repaint();
         }
@@ -827,7 +1294,18 @@ impl AuroraApp {
             DocumentData::TwoDa(table) => table.rows.len(),
             DocumentData::Itp(_) => return 0,
         };
-        let mut rows = Self::selected_rows(document, count);
+        Self::delete_document_rows_at(document, Self::selected_rows(document, count))
+    }
+
+    fn delete_document_rows_at(document: &mut Document, mut rows: Vec<usize>) -> usize {
+        let count = match &document.data {
+            DocumentData::Tlk(tlk) => tlk.entries.len(),
+            DocumentData::TwoDa(table) => table.rows.len(),
+            DocumentData::Itp(_) => return 0,
+        };
+        rows.retain(|row| *row < count);
+        rows.sort_unstable();
+        rows.dedup();
         if rows.is_empty() {
             return 0;
         }
@@ -877,14 +1355,14 @@ impl AuroraApp {
     }
 
     fn apply_row_menu_action(document: &mut Document, action: RowMenuAction) {
-        if matches!(action, RowMenuAction::Delete) {
-            Self::delete_document_rows(document);
+        if let RowMenuAction::Delete(rows) = action {
+            Self::delete_document_rows_at(document, rows);
             return;
         }
         let requested = match action {
             RowMenuAction::InsertAbove(row) => row,
             RowMenuAction::InsertBelow(row) => row.saturating_add(1),
-            RowMenuAction::Delete => unreachable!(),
+            RowMenuAction::Delete(_) => unreachable!(),
         };
         let position = match &mut document.data {
             DocumentData::Tlk(tlk) => {
@@ -1194,6 +1672,15 @@ impl AuroraApp {
             });
             self.active = Some(index);
         } else {
+            if !self.pending_saves.is_empty()
+                || !self.queued_saves.is_empty()
+                || !self.pending_opens.is_empty()
+                || !self.queued_opens.is_empty()
+            {
+                self.quit_after_saves = true;
+                self.set_message("Waiting for background work to finish…", false);
+                return;
+            }
             self.allow_exit = true;
             self.sync_state();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1212,13 +1699,8 @@ impl AuroraApp {
         match choice {
             CloseChoice::Cancel => self.pending_close = None,
             CloseChoice::Save => {
-                if self.save_document(pending.index, false) {
-                    if pending.quitting {
-                        self.continue_quit(ctx);
-                    } else {
-                        self.pending_close = None;
-                        self.remove_document(pending.index);
-                    }
+                if self.save_document(pending.index, false, Some(pending)) == SaveOutcome::Started {
+                    self.pending_close = None;
                 }
             }
             CloseChoice::Discard => {
@@ -1705,19 +2187,19 @@ impl AuroraApp {
             Command::Open => self.open_dialog(),
             Command::Save => {
                 if let Some(i) = self.active {
-                    self.save_document(i, false);
+                    self.save_document(i, false, None);
                 }
             }
             Command::SaveAs => {
                 if let Some(i) = self.active {
-                    self.save_document(i, true);
+                    self.save_document(i, true, None);
                 }
             }
             Command::SaveAll => {
                 let count = self.documents.len();
                 for index in 0..count {
                     if self.documents[index].dirty {
-                        self.save_document(index, false);
+                        self.save_document(index, false, None);
                     }
                 }
             }
@@ -2054,9 +2536,7 @@ impl AuroraApp {
                     let is_twoda = matches!(document.data, DocumentData::TwoDa(_));
                     let is_tlk = matches!(document.data, DocumentData::Tlk(_));
                     ui.menu_button("Table", |ui| {
-                        // Keep the command labels on one line instead of letting
-                        // the popup inherit the narrow width of the menu title.
-                        ui.set_min_width(300.0);
+                        ui.set_min_width(if is_twoda { 240.0 } else { 140.0 });
                         if ui.button("Resize…").clicked() {
                             command = Some(Command::ResizeTable);
                             ui.close();
@@ -2125,122 +2605,243 @@ impl AuroraApp {
     fn tab_bar(&mut self, root: &mut egui::Ui) {
         let mut activate = None;
         let mut close = None;
-        egui::Panel::top("tabs").show(root, |ui| {
-            egui::ScrollArea::horizontal()
-                .id_salt("document_tabs")
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_sized([52.0, 26.0], egui::Button::new("Open"))
-                            .on_hover_text("Open file (Ctrl+O)")
-                            .clicked()
-                        {
-                            self.open_dialog();
-                        }
-                        ui.add_space(4.0);
-                        for (index, doc) in self.documents.iter().enumerate() {
-                            let title =
-                                format!("{}{}", if doc.dirty { "* " } else { "" }, doc.title());
-                            let selected = self.active == Some(index);
-                            let selection = ui.visuals().selection.bg_fill;
-                            let tab = egui::Frame::new()
-                                .fill(if selected {
-                                    selection.gamma_multiply(0.28)
-                                } else {
-                                    Color32::TRANSPARENT
-                                })
-                                .stroke(if selected {
-                                    egui::Stroke::new(1.0, selection.gamma_multiply(0.55))
-                                } else {
-                                    egui::Stroke::NONE
-                                })
-                                .corner_radius(4)
-                                .inner_margin(egui::Margin::symmetric(8, 3))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        let title_response = ui.add(
-                                            egui::Label::new(RichText::new(title).color(
-                                                if selected {
-                                                    ui.visuals().strong_text_color()
-                                                } else {
-                                                    ui.visuals().text_color()
-                                                },
-                                            ))
-                                            .selectable(false)
-                                            .sense(egui::Sense::click()),
-                                        );
-                                        let (close_rect, close_response) = ui.allocate_exact_size(
-                                            egui::vec2(18.0, 18.0),
-                                            egui::Sense::click(),
-                                        );
-                                        if close_response.hovered() {
-                                            ui.painter().rect_filled(
-                                                close_rect,
-                                                4.0,
-                                                ui.visuals().selection.bg_fill.gamma_multiply(0.72),
-                                            );
-                                        }
-                                        ui.painter().text(
-                                            close_rect.center(),
-                                            Align2::CENTER_CENTER,
-                                            "×",
-                                            egui::FontId::proportional(14.0),
-                                            if close_response.hovered() {
-                                                ui.visuals().selection.stroke.color
-                                            } else {
-                                                ui.visuals().strong_text_color()
-                                            },
-                                        );
-                                        let close_response =
-                                            close_response.on_hover_text("Close tab");
-                                        (title_response, close_response)
-                                    })
-                                    .inner
-                                });
-                            let (title_response, close_response) = tab.inner;
-                            if selected {
-                                ui.painter().line_segment(
-                                    [
-                                        egui::pos2(
-                                            tab.response.rect.left() + 4.0,
-                                            tab.response.rect.bottom(),
-                                        ),
-                                        egui::pos2(
-                                            tab.response.rect.right() - 4.0,
-                                            tab.response.rect.bottom(),
-                                        ),
-                                    ],
-                                    egui::Stroke::new(2.0, selection),
-                                );
-                            }
-                            title_response.context_menu(|ui| {
-                                if ui.button("Close tab").clicked() {
-                                    close = Some(index);
+        let mut open_recent = None;
+        let mut clear_recent = false;
+        let recent_files = self.state.recent_files.clone();
+        egui::Panel::top("tabs")
+            .frame(
+                egui::Frame::side_top_panel(root.style())
+                    .inner_margin(egui::Margin::symmetric(8, 2)),
+            )
+            .show(root, |ui| {
+                // Only document tabs scroll. This keeps the Open/Recent controls fixed and
+                // matches the Aurora Hak Explorer layout.
+                ui.spacing_mut().scroll.floating = false;
+                ui.horizontal_top(|ui| {
+                    if ui
+                        .add_sized([69.0, 31.0], egui::Button::new("Open"))
+                        .on_hover_text("Open file (Ctrl+O)")
+                        .clicked()
+                    {
+                        self.open_dialog();
+                    }
+                    let recent_response = ui.add_sized([83.0, 31.0], egui::Button::new(""));
+                    recent_response.clone().on_hover_text("Open a recent file");
+                    ui.painter().text(
+                        recent_response.rect.center(),
+                        Align2::CENTER_CENTER,
+                        "Recent",
+                        egui::TextStyle::Button.resolve(ui.style()),
+                        ui.style().interact(&recent_response).text_color(),
+                    );
+                    let _ = egui::Popup::menu(&recent_response).show(|ui| {
+                        ui.set_min_width(240.0);
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                        if recent_files.is_empty() {
+                            ui.add_enabled(false, egui::Button::new("No recent files"));
+                        } else {
+                            for path in &recent_files {
+                                let name = path
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("Aurora document");
+                                if ui
+                                    .button(name)
+                                    .on_hover_text(path.display().to_string())
+                                    .clicked()
+                                {
+                                    open_recent = Some(path.clone());
                                     ui.close();
                                 }
-                            });
-                            if title_response.middle_clicked() || close_response.middle_clicked() {
-                                close = Some(index);
-                            } else if title_response.clicked() {
-                                activate = Some(index);
                             }
-                            if close_response.clicked() {
-                                close = Some(index);
+                            ui.separator();
+                            if ui.button("Clear recent files").clicked() {
+                                clear_recent = true;
+                                ui.close();
                             }
-                            ui.add_space(2.0);
-                        }
-                        if self.documents.is_empty() {
-                            ui.label(RichText::new("No documents open").weak());
                         }
                     });
+                    ui.add_space(4.0);
+                    let tabs_width = ui.available_width();
+                    // Scope AHE's compact scrollbar treatment to the tab strip; document
+                    // tables continue using the wider, easier-to-grab scrollbar.
+                    ui.spacing_mut().scroll.bar_width = 8.0;
+                    ui.spacing_mut().scroll.bar_inner_margin = 1.0;
+                    egui::ScrollArea::horizontal()
+                        .id_salt("document_tabs")
+                        .max_width(tabs_width)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for (index, doc) in self.documents.iter().enumerate() {
+                                    let title = format!(
+                                        "{}{}",
+                                        if doc.dirty { "* " } else { "" },
+                                        doc.title()
+                                    );
+                                    let selected = self.active == Some(index);
+                                    let selection = ui.visuals().selection.bg_fill;
+                                    let title_color = if selected {
+                                        ui.visuals().strong_text_color()
+                                    } else {
+                                        ui.visuals().text_color()
+                                    };
+                                    let title_font = egui::TextStyle::Body.resolve(ui.style());
+                                    let title_width = ui
+                                        .painter()
+                                        .layout_no_wrap(
+                                            title.clone(),
+                                            title_font.clone(),
+                                            title_color,
+                                        )
+                                        .size()
+                                        .x;
+                                    // This is deliberately the same fixed 31px tab geometry used by
+                                    // Aurora Hak Explorer, including the title and close hit areas.
+                                    let tab_size = egui::vec2(
+                                        12.0 + title_width
+                                            + ui.spacing().item_spacing.x
+                                            + 23.0
+                                            + 12.0,
+                                        31.0,
+                                    );
+                                    let (tab_rect, _) =
+                                        ui.allocate_exact_size(tab_size, egui::Sense::hover());
+                                    let tab_id = ui.make_persistent_id(("document_tab", index));
+                                    let close_rect = egui::Rect::from_min_size(
+                                        egui::pos2(tab_rect.right() - 35.0, tab_rect.top() + 4.0),
+                                        egui::vec2(23.0, 23.0),
+                                    );
+                                    let title_rect = egui::Rect::from_min_max(
+                                        egui::pos2(tab_rect.left() + 12.0, tab_rect.top() + 4.0),
+                                        egui::pos2(
+                                            close_rect.left() - ui.spacing().item_spacing.x,
+                                            tab_rect.bottom() - 4.0,
+                                        ),
+                                    );
+                                    let title_response = ui.interact(
+                                        title_rect,
+                                        tab_id.with("title"),
+                                        egui::Sense::click(),
+                                    );
+                                    let close_response = ui
+                                        .interact(
+                                            close_rect,
+                                            tab_id.with("close"),
+                                            egui::Sense::click(),
+                                        )
+                                        .on_hover_text("Close tab");
+                                    if selected {
+                                        ui.painter().rect_filled(
+                                            tab_rect,
+                                            4.0,
+                                            selection.gamma_multiply(0.82),
+                                        );
+                                    }
+                                    if close_response.hovered() {
+                                        ui.painter().rect_filled(
+                                            close_rect,
+                                            4.0,
+                                            selection.gamma_multiply(0.72),
+                                        );
+                                    }
+                                    ui.painter().text(
+                                        egui::pos2(title_rect.left(), title_rect.center().y),
+                                        Align2::LEFT_CENTER,
+                                        &title,
+                                        title_font,
+                                        title_color,
+                                    );
+                                    ui.painter().text(
+                                        close_rect.center(),
+                                        Align2::CENTER_CENTER,
+                                        "×",
+                                        egui::FontId::proportional(14.0),
+                                        ui.visuals().strong_text_color(),
+                                    );
+                                    if selected {
+                                        ui.painter().rect_stroke(
+                                            tab_rect,
+                                            4.0,
+                                            egui::Stroke::new(1.0, selection.gamma_multiply(0.95)),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                        ui.painter().line_segment(
+                                            [
+                                                egui::pos2(
+                                                    tab_rect.left() + 4.0,
+                                                    tab_rect.bottom(),
+                                                ),
+                                                egui::pos2(
+                                                    tab_rect.right() - 4.0,
+                                                    tab_rect.bottom(),
+                                                ),
+                                            ],
+                                            egui::Stroke::new(2.0, selection),
+                                        );
+                                    } else if title_response.hovered() || close_response.hovered() {
+                                        ui.painter().rect_stroke(
+                                            tab_rect,
+                                            4.0,
+                                            egui::Stroke::new(1.0, selection.gamma_multiply(0.75)),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                    }
+                                    title_response.context_menu(|ui| {
+                                        if ui.button("Close tab").clicked() {
+                                            close = Some(index);
+                                            ui.close();
+                                        }
+                                    });
+                                    if title_response.middle_clicked()
+                                        || close_response.middle_clicked()
+                                    {
+                                        close = Some(index);
+                                    } else if title_response.clicked() {
+                                        activate = Some(index);
+                                    }
+                                    if close_response.clicked() {
+                                        close = Some(index);
+                                    }
+                                    ui.add_space(2.0);
+                                }
+                                if self.documents.is_empty() {
+                                    let text = "No documents open";
+                                    let font = egui::TextStyle::Body.resolve(ui.style());
+                                    let color = ui.visuals().weak_text_color();
+                                    let width = ui
+                                        .painter()
+                                        .layout_no_wrap(text.into(), font.clone(), color)
+                                        .size()
+                                        .x;
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(width, 31.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().text(
+                                        rect.center(),
+                                        Align2::CENTER_CENTER,
+                                        text,
+                                        font,
+                                        color,
+                                    );
+                                }
+                            });
+                        });
                 });
-        });
+            });
         if let Some(index) = activate {
             self.active = Some(index);
             self.sync_state();
         }
         if let Some(index) = close {
             self.request_close(index);
+        }
+        if let Some(path) = open_recent {
+            self.open_path(&path, true);
+        }
+        if clear_recent {
+            self.state.recent_files.clear();
+            self.sync_state();
         }
     }
 
@@ -2285,11 +2886,86 @@ impl AuroraApp {
         (add, delete)
     }
 
+    fn row_insert_dialog(
+        ui: &mut egui::Ui,
+        doc: &Document,
+        dialog_state: &mut Option<RowInsertDialogState>,
+    ) -> Option<(usize, bool)> {
+        let dialog = dialog_state.as_mut()?;
+        if dialog.document_id != doc.id {
+            *dialog_state = None;
+            return None;
+        }
+
+        let target = doc.selected_row.map_or_else(
+            || "the end of the table".to_owned(),
+            |row| format!("row {row}"),
+        );
+        let mut insert = None;
+        let mut cancel = ui.input(|input| input.key_pressed(egui::Key::Escape));
+        egui::Window::new(RichText::new("Insert rows").size(18.0))
+            .id(dialog.window_id)
+            .collapsible(false)
+            .resizable(false)
+            .movable(true)
+            .fixed_size(egui::vec2(420.0, 230.0))
+            .default_pos(ui.ctx().content_rect().center())
+            .pivot(Align2::CENTER_CENTER)
+            .show(ui.ctx(), |ui| {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Add blank rows to this document")
+                        .size(15.0)
+                        .strong(),
+                );
+                ui.add_space(8.0);
+                ui.label(format!("Insert relative to {target}."));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Number of rows").size(14.0));
+                    ui.add_space(8.0);
+                    ui.add_sized(
+                        [110.0, 30.0],
+                        egui::DragValue::new(&mut dialog.count).range(1..=100_000),
+                    );
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut dialog.below, false, "Above selected row");
+                    ui.add_space(16.0);
+                    ui.radio_value(&mut dialog.below, true, "Below selected row");
+                });
+                ui.add_space(10.0);
+                let buttons_width = 120.0 + 8.0 + 104.0;
+                ui.horizontal(|ui| {
+                    ui.add_space(((ui.available_width() - buttons_width) / 2.0).max(0.0));
+                    if ui
+                        .add_sized([120.0, 34.0], egui::Button::new("Insert rows"))
+                        .clicked()
+                    {
+                        insert = Some((dialog.count, dialog.below));
+                    }
+                    ui.add_space(8.0);
+                    if ui
+                        .add_sized([104.0, 34.0], egui::Button::new("Cancel"))
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+            });
+        if cancel || insert.is_some() {
+            *dialog_state = None;
+        }
+        insert
+    }
+
     fn tlk_editor(
         ui: &mut egui::Ui,
         doc: &mut Document,
         display_user_strref: bool,
         display_hex_strref: bool,
+        row_insert_dialog: &mut Option<RowInsertDialogState>,
     ) {
         let table_id = (
             "tlk_table",
@@ -2303,25 +2979,38 @@ impl AuroraApp {
         if delete && Self::delete_document_rows(doc) > 0 {
             doc.dirty = !doc.history.is_clean();
         }
+        if add && row_insert_dialog.is_none() {
+            *row_insert_dialog = Some(RowInsertDialogState {
+                document_id: doc.id,
+                window_id: ui.make_persistent_id((
+                    "row_insert_dialog",
+                    doc.id,
+                    ui.input(|input| input.time.to_bits()),
+                )),
+                count: 1,
+                below: true,
+            });
+        }
+        let insert_request = Self::row_insert_dialog(ui, doc, row_insert_dialog);
         let DocumentData::Tlk(tlk) = &mut doc.data else {
             return;
         };
-        if add {
-            let position = doc
-                .selected_row
-                .map_or(tlk.entries.len(), |row| (row + 1).min(tlk.entries.len()));
-            let inserted = TlkEntry::default();
-            tlk.entries.insert(position, inserted.clone());
-            Self::tlk_rows_inserted(&mut doc.tlk_modified, position, 1);
+        if let Some((count, below)) = insert_request {
+            let position = doc.selected_row.map_or(tlk.entries.len(), |row| {
+                (row + usize::from(below)).min(tlk.entries.len())
+            });
+            let inserted = vec![TlkEntry::default(); count];
+            tlk.entries.splice(position..position, inserted.clone());
+            Self::tlk_rows_inserted(&mut doc.tlk_modified, position, count);
             doc.selected_row = Some(position);
             doc.selected_rows.clear();
-            doc.selected_rows.insert(position);
+            doc.selected_rows.extend(position..position + count);
             doc.selection_anchor = Some(position);
             doc.scroll_to_selected = true;
             doc.history.record(EditAction::TlkRows {
                 index: position,
                 removed: Vec::new(),
-                inserted: vec![inserted],
+                inserted,
             });
             doc.dirty = !doc.history.is_clean();
         }
@@ -2403,11 +3092,14 @@ impl AuroraApp {
             None
         };
         let table_height = (ui.available_height() - 150.0).max(56.0);
+        // The custom horizontal scrollbar is painted inside the table's bounds.
+        // Reserve its strip so it never covers the last visible row.
+        let table_body_height = (table_height - ui.spacing().scroll.bar_width.max(12.0)).max(40.0);
         if let Some(row) = scroll_to {
             doc.table_first_row = row;
         }
         let row_step = 25.0 + ui.spacing().item_spacing.y;
-        let window_size = (table_height / row_step).ceil() as usize + 2;
+        let window_size = (table_body_height / row_step).ceil() as usize + 2;
         if scroll_to.is_some() {
             doc.table_first_row = doc.table_first_row.saturating_sub(window_size / 2);
         }
@@ -2425,7 +3117,7 @@ impl AuroraApp {
             .cell_layout(Layout::left_to_right(Align::Center))
             .resizable(true)
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-            .max_scroll_height(table_height)
+            .max_scroll_height(table_body_height)
             .auto_shrink([false, false])
             .column(Column::initial(105.0).at_least(70.0));
         let table_output = builder
@@ -2447,11 +3139,12 @@ impl AuroraApp {
                     let entry = &mut tlk.entries[index];
                     let before = entry.clone();
                     let selected = doc.selected_rows.contains(&index);
+                    let strref_selected = selected || doc.selected_row == Some(index);
                     row.set_selected(selected);
                     row.col(|ui| {
                         let (rect, response) =
                             ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
-                        if selected {
+                        if strref_selected {
                             ui.painter()
                                 .rect_filled(rect, 0.0, ui.visuals().selection.bg_fill);
                         }
@@ -2468,7 +3161,7 @@ impl AuroraApp {
                                 format_strref(index)
                             ),
                             egui::TextStyle::Body.resolve(ui.style()),
-                            if selected {
+                            if strref_selected {
                                 ui.visuals().selection.stroke.color
                             } else {
                                 ui.visuals().text_color()
@@ -2497,7 +3190,7 @@ impl AuroraApp {
                         Self::row_action_context_menu(
                             &response,
                             index,
-                            doc.selected_rows.len().max(1),
+                            doc.selected_rows.iter().copied().collect(),
                             &mut row_menu_action,
                         );
                     });
@@ -2521,7 +3214,7 @@ impl AuroraApp {
                         Self::row_action_context_menu(
                             &r,
                             index,
-                            doc.selected_rows.len().max(1),
+                            doc.selected_rows.iter().copied().collect(),
                             &mut row_menu_action,
                         );
                     });
@@ -2577,10 +3270,13 @@ impl AuroraApp {
         );
         Self::middle_mouse_table_scroll(
             ui,
-            table_output.inner_rect,
-            visible_count,
-            window_size,
-            table_output.content_size.x,
+            vertical_scroll_id.with("middle_mouse_scroll"),
+            TableScrollBounds {
+                viewport: table_output.inner_rect,
+                row_count: visible_count,
+                visible_rows: window_size,
+                content_width: table_output.content_size.x,
+            },
             &mut doc.table_first_row,
             &mut doc.table_scroll_x,
         );
@@ -2631,6 +3327,7 @@ impl AuroraApp {
         ui: &mut egui::Ui,
         doc: &mut Document,
         column_dialog: &mut Option<ColumnDialogState>,
+        row_insert_dialog: &mut Option<RowInsertDialogState>,
     ) {
         let table_id = (
             "twoda_table",
@@ -2644,27 +3341,45 @@ impl AuroraApp {
         if delete && Self::delete_document_rows(doc) > 0 {
             doc.dirty = !doc.history.is_clean();
         }
+        if add && row_insert_dialog.is_none() {
+            *row_insert_dialog = Some(RowInsertDialogState {
+                document_id: doc.id,
+                window_id: ui.make_persistent_id((
+                    "row_insert_dialog",
+                    doc.id,
+                    ui.input(|input| input.time.to_bits()),
+                )),
+                count: 1,
+                below: true,
+            });
+        }
+        let insert_request = Self::row_insert_dialog(ui, doc, row_insert_dialog);
         let DocumentData::TwoDa(table) = &mut doc.data else {
             return;
         };
-        if add {
-            let mut row = vec!["****".to_owned(); table.columns.len()];
-            let position = doc
-                .selected_row
-                .map_or(table.rows.len(), |row| (row + 1).min(table.rows.len()));
-            if let Some(first) = row.first_mut() {
-                *first = position.to_string();
-            }
-            table.rows.insert(position, row.clone());
+        if let Some((count, below)) = insert_request {
+            let position = doc.selected_row.map_or(table.rows.len(), |row| {
+                (row + usize::from(below)).min(table.rows.len())
+            });
+            let rows: Vec<Vec<String>> = (0..count)
+                .map(|offset| {
+                    let mut row = vec!["****".to_owned(); table.columns.len()];
+                    if let Some(first) = row.first_mut() {
+                        *first = (position + offset).to_string();
+                    }
+                    row
+                })
+                .collect();
+            table.rows.splice(position..position, rows.clone());
             doc.selected_row = Some(position);
             doc.selected_rows.clear();
-            doc.selected_rows.insert(position);
+            doc.selected_rows.extend(position..position + count);
             doc.selection_anchor = Some(position);
             doc.scroll_to_selected = true;
             doc.history.record(EditAction::TwoDaRows {
                 index: position,
                 removed: Vec::new(),
-                inserted: vec![row],
+                inserted: rows,
             });
             doc.dirty = !doc.history.is_clean();
         }
@@ -2759,11 +3474,13 @@ impl AuroraApp {
         };
         let headers = table.columns.clone();
         let table_height = ui.available_height().max(56.0);
+        // Keep the final row above the custom horizontal scrollbar.
+        let table_body_height = (table_height - ui.spacing().scroll.bar_width.max(12.0)).max(40.0);
         if let Some(row) = scroll_to {
             doc.table_first_row = row;
         }
         let row_step = 26.0 + ui.spacing().item_spacing.y;
-        let window_size = (table_height / row_step).ceil() as usize + 2;
+        let window_size = (table_body_height / row_step).ceil() as usize + 2;
         if scroll_to.is_some() {
             doc.table_first_row = doc.table_first_row.saturating_sub(window_size / 2);
         }
@@ -2781,15 +3498,17 @@ impl AuroraApp {
             .striped(true)
             .cell_layout(Layout::left_to_right(Align::Center))
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-            .max_scroll_height(table_height)
+            .max_scroll_height(table_body_height)
             .auto_shrink([false, false])
             .resizable(true);
-        builder = builder.column(Column::initial(70.0).at_least(55.0));
+        builder = builder.column(Column::exact(70.0));
         for (index, _) in headers.iter().enumerate() {
             builder = builder.column(if index == 0 {
-                Column::initial(75.0)
+                Column::initial(75.0).at_least(75.0).clip(true)
             } else {
-                Column::initial(130.0).at_least(70.0)
+                // Size new columns from their contents (including the header),
+                // while clipping any unusually long values inside their cell.
+                Column::auto().at_least(100.0).clip(true)
             });
         }
         let table_output = builder
@@ -2958,7 +3677,7 @@ impl AuroraApp {
                         Self::row_action_context_menu(
                             &response,
                             row_index,
-                            doc.selected_rows.len().max(1),
+                            doc.selected_rows.iter().copied().collect(),
                             &mut row_menu_action,
                         );
                     });
@@ -3000,7 +3719,7 @@ impl AuroraApp {
                             Self::row_action_context_menu(
                                 &response,
                                 row_index,
-                                doc.selected_rows.len().max(1),
+                                doc.selected_rows.iter().copied().collect(),
                                 &mut row_menu_action,
                             );
                         });
@@ -3029,6 +3748,15 @@ impl AuroraApp {
                 });
             });
         doc.table_scroll_x = table_output.state.offset.x;
+        Self::sticky_twoda_index_column(
+            ui,
+            table_output.inner_rect,
+            first_visible,
+            visible.as_deref(),
+            window_count,
+            &doc.selected_rows,
+            &doc.selected_cells,
+        );
         Self::vertical_table_scrollbar(
             ui,
             vertical_scroll_id,
@@ -3046,10 +3774,13 @@ impl AuroraApp {
         );
         Self::middle_mouse_table_scroll(
             ui,
-            table_output.inner_rect,
-            visible_count,
-            window_size,
-            table_output.content_size.x,
+            vertical_scroll_id.with("middle_mouse_scroll"),
+            TableScrollBounds {
+                viewport: table_output.inner_rect,
+                row_count: visible_count,
+                visible_rows: window_size,
+                content_width: table_output.content_size.x,
+            },
             &mut doc.table_first_row,
             &mut doc.table_scroll_x,
         );
@@ -3371,7 +4102,7 @@ impl AuroraApp {
         }
     }
 
-    fn central(&mut self, root: &mut egui::Ui, ctx: &egui::Context) {
+    fn central(&mut self, root: &mut egui::Ui) {
         egui::CentralPanel::default().show(root, |ui| {
             if let Some(index) = self.active.filter(|i| *i < self.documents.len()) {
                 match self.documents[index].data {
@@ -3380,38 +4111,79 @@ impl AuroraApp {
                         &mut self.documents[index],
                         self.state.display_user_strref,
                         self.state.display_hex_strref,
+                        &mut self.row_insert_dialog,
                     ),
-                    DocumentData::TwoDa(_) => {
-                        Self::twoda_editor(ui, &mut self.documents[index], &mut self.column_dialog)
-                    }
+                    DocumentData::TwoDa(_) => Self::twoda_editor(
+                        ui,
+                        &mut self.documents[index],
+                        &mut self.column_dialog,
+                        &mut self.row_insert_dialog,
+                    ),
                     DocumentData::Itp(_) => Self::itp_editor(ui, &mut self.documents[index]),
                 }
             } else {
-                ui.horizontal(|ui| {
-                    if ui.button("Open").clicked() {
-                        self.open_dialog();
-                    }
-                    if ui.button("New TLK").clicked() {
-                        self.run_command(ctx, Command::NewTlk);
-                    }
-                    if ui.button("New 2DA").clicked() {
-                        self.run_command(ctx, Command::NewTwoDa);
-                    }
-                });
+                let recent_files = self.state.recent_files.clone();
+                let mut open_recent = None;
+                let mut clear_recent = false;
                 ui.vertical_centered(|ui| {
                     ui.add_space(80.0);
                     ui.heading("Aurora TLK Explorer");
                     ui.label(
-                        RichText::new("A modern workspace for Neverwinter Nights data files")
-                            .weak(),
+                        RichText::new(
+                            "An editor for Neverwinter Nights TLK talk tables, 2DA data tables, and ITP palette structures.",
+                        )
+                        .weak(),
                     );
                     ui.add_space(12.0);
                     ui.label(
-                        RichText::new("You can also drop .tlk and .2da files into this window.")
-                            .small()
-                            .weak(),
+                        RichText::new(
+                            "Open a file above, or drag and drop .tlk, .2da, and .itp files anywhere into this window.",
+                        )
+                        .small()
+                        .weak(),
                     );
+                    if !recent_files.is_empty() {
+                        ui.add_space(34.0);
+                        ui.label(RichText::new("Recent files").size(14.0).strong());
+                        ui.add_space(6.0);
+                        let fill = ui.visuals().widgets.inactive.bg_fill;
+                        let stroke = ui.visuals().widgets.inactive.bg_stroke;
+                        for path in &recent_files {
+                            let name = path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("Aurora document");
+                            let button = egui::Button::new(RichText::new(name).size(13.5))
+                                .fill(fill)
+                                .stroke(stroke)
+                                .corner_radius(4.0);
+                            let response = ui.add_sized([280.0, 34.0], button);
+                            if response.clicked() {
+                                open_recent = Some(path.clone());
+                            }
+                            response.on_hover_text(path.display().to_string());
+                        }
+                        ui.add_space(10.0);
+                        let clear_button =
+                            egui::Button::new(RichText::new("Clear recent files").size(13.0))
+                                .fill(fill)
+                                .stroke(stroke)
+                                .corner_radius(4.0);
+                        if ui
+                            .add_sized([180.0, 34.0], clear_button)
+                            .clicked()
+                        {
+                            clear_recent = true;
+                        }
+                    }
                 });
+                if let Some(path) = open_recent {
+                    self.open_path(&path, true);
+                }
+                if clear_recent {
+                    self.state.recent_files.clear();
+                    self.sync_state();
+                }
             }
         });
     }
@@ -3782,8 +4554,10 @@ impl AuroraApp {
 impl eframe::App for AuroraApp {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
-        self.poll_open_jobs();
-        if !self.pending_opens.is_empty() {
+        self.poll_external_open_requests(&ctx);
+        self.poll_open_jobs(&ctx);
+        self.poll_save_jobs(&ctx);
+        if !self.pending_opens.is_empty() || !self.pending_saves.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_exit {
@@ -3815,12 +4589,15 @@ impl eframe::App for AuroraApp {
                 )
             })
             .unwrap_or_else(|| APP_NAME.to_owned());
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(window_title));
+        if self.last_window_title.as_deref() != Some(&window_title) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(window_title.clone()));
+            self.last_window_title = Some(window_title);
+        }
 
         self.top_bar(root, &ctx);
         self.tab_bar(root);
         self.status_bar(root);
-        self.central(root, &ctx);
+        self.central(root);
         self.resize_dialog(&ctx);
         self.column_dialog(&ctx);
         self.diff_overview(&ctx);
@@ -3928,17 +4705,24 @@ mod tests {
             state: PersistentState::default(),
             pending_close: None,
             allow_exit: false,
+            quit_after_saves: false,
             message: None,
             clipboard: None,
             clipboard_text: None,
             pending_paste_text: None,
             resize_value: None,
             column_dialog: None,
+            row_insert_dialog: None,
             show_diff_overview: false,
             search_window_open: false,
             focus_search_window: false,
             pending_opens: Vec::new(),
+            queued_opens: VecDeque::new(),
+            pending_saves: Vec::new(),
+            queued_saves: VecDeque::new(),
             restore_active_file: None,
+            last_window_title: None,
+            incoming_paths: None,
         };
 
         assert!(app.copy_selected_row(&egui::Context::default()));
@@ -3975,17 +4759,24 @@ mod tests {
             state: PersistentState::default(),
             pending_close: None,
             allow_exit: false,
+            quit_after_saves: false,
             message: None,
             clipboard: None,
             clipboard_text: None,
             pending_paste_text: None,
             resize_value: None,
             column_dialog: None,
+            row_insert_dialog: None,
             show_diff_overview: false,
             search_window_open: false,
             focus_search_window: false,
             pending_opens: Vec::new(),
+            queued_opens: VecDeque::new(),
+            pending_saves: Vec::new(),
+            queued_saves: VecDeque::new(),
             restore_active_file: None,
+            last_window_title: None,
+            incoming_paths: None,
         };
 
         assert!(app.copy_selected_row(&egui::Context::default()));
@@ -4003,6 +4794,114 @@ mod tests {
         assert_eq!(
             app.documents[0].selected_cells,
             BTreeSet::from([(1, 1), (1, 2)])
+        );
+    }
+
+    #[test]
+    fn background_save_does_not_mark_newer_edits_as_saved() {
+        let path = std::env::temp_dir().join(format!(
+            "aurora-background-save-{}-{}.tlk",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut document = Document::new_tlk();
+        document.path = Some(path.clone());
+        let DocumentData::Tlk(tlk) = &mut document.data else {
+            unreachable!();
+        };
+        tlk.entries.push(TlkEntry {
+            text: "saved snapshot".into(),
+            ..Default::default()
+        });
+
+        let mut app = AuroraApp {
+            documents: vec![document],
+            active: Some(0),
+            state: PersistentState::default(),
+            pending_close: None,
+            allow_exit: false,
+            quit_after_saves: false,
+            message: None,
+            clipboard: None,
+            clipboard_text: None,
+            pending_paste_text: None,
+            resize_value: None,
+            column_dialog: None,
+            row_insert_dialog: None,
+            show_diff_overview: false,
+            search_window_open: false,
+            focus_search_window: false,
+            pending_opens: Vec::new(),
+            queued_opens: VecDeque::new(),
+            pending_saves: Vec::new(),
+            queued_saves: VecDeque::new(),
+            restore_active_file: None,
+            last_window_title: None,
+            incoming_paths: None,
+        };
+        assert_eq!(app.save_document(0, false, None), SaveOutcome::Started);
+
+        let before = match &app.documents[0].data {
+            DocumentData::Tlk(tlk) => tlk.entries[0].clone(),
+            _ => unreachable!(),
+        };
+        let mut after = before.clone();
+        after.text = "newer unsaved edit".into();
+        let DocumentData::Tlk(tlk) = &mut app.documents[0].data else {
+            unreachable!();
+        };
+        tlk.entries[0] = after.clone();
+        app.documents[0].record(EditAction::TlkEntry {
+            row: 0,
+            before,
+            after,
+        });
+
+        let ctx = egui::Context::default();
+        for _ in 0..100 {
+            app.poll_save_jobs(&ctx);
+            if app.pending_saves.is_empty() && app.queued_saves.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.pending_saves.is_empty());
+        assert!(app.documents[0].dirty);
+        assert_eq!(
+            aurora_tlk_explorer::formats::tlk::TlkFile::read(&path)
+                .unwrap()
+                .entries[0]
+                .text,
+            "saved snapshot"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recent_files_are_deduplicated_newest_first_and_bounded() {
+        let mut recent = Vec::new();
+        for index in 0..10 {
+            AuroraApp::update_recent_files(
+                &mut recent,
+                &PathBuf::from(format!("/missing/recent-{index}.2da")),
+            );
+        }
+        assert_eq!(recent.len(), MAX_RECENT_FILES);
+        assert_eq!(recent[0], PathBuf::from("/missing/recent-9.2da"));
+        assert_eq!(recent[7], PathBuf::from("/missing/recent-2.2da"));
+
+        AuroraApp::update_recent_files(&mut recent, Path::new("/missing/recent-5.2da"));
+        assert_eq!(recent.len(), MAX_RECENT_FILES);
+        assert_eq!(recent[0], PathBuf::from("/missing/recent-5.2da"));
+        assert_eq!(
+            recent
+                .iter()
+                .filter(|path| path.ends_with("recent-5.2da"))
+                .count(),
+            1
         );
     }
 
@@ -4073,6 +4972,9 @@ mod tests {
             phase: egui::TouchPhase::Move,
         });
         render(&ctx, wheel, &mut first_row);
+        for _ in 0..10 {
+            render(&ctx, egui::RawInput::default(), &mut first_row);
+        }
         assert!(
             first_row > 0,
             "standalone wheel input did not move the table"

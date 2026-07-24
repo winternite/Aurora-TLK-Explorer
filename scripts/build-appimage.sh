@@ -39,6 +39,8 @@ install -Dm644 "$ROOT/assets/aurora-tlk-explorer.png" \
     "$APPDIR/usr/share/icons/hicolor/512x512/apps/aurora-tlk-explorer.png"
 install -Dm644 "$ROOT/assets/ateicon.png" \
     "$APPDIR/usr/share/aurora-tlk-explorer/ateicon.png"
+install -Dm644 "$ROOT/assets/kwin-active-output.js" \
+    "$APPDIR/usr/share/aurora-tlk-explorer/kwin-active-output.js"
 install -Dm644 "$ROOT/assets/org.aurora_tools.AuroraTlkExplorer.desktop" \
     "$APPDIR/usr/share/applications/org.aurora_tools.AuroraTlkExplorer.desktop"
 install -Dm644 "$ROOT/assets/org.aurora_tools.AuroraTlkExplorer.metainfo.xml" \
