@@ -8,6 +8,8 @@
 - Search, replace, cut/copy/paste, add, insert, delete, renumber, resize, and
   edit table rows and columns.
 - Insert multiple blank TLK or 2DA rows above or below the selection.
+- Move between editable TLK and 2DA table text fields with the Up and Down
+  arrow keys.
 - Keep 2DA Index and TLK StrRef columns visible while scrolling horizontally.
 - View User StrRef and hexadecimal StrRef representations.
 - Use TlkEdit-compatible diff, DTU merge, marking, and overview workflows.

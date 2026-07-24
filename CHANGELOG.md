@@ -11,6 +11,8 @@ Semantic Versioning.
   highlighting.
 - Added multi-row insertion above or below a selected row and correct
   multi-row deletion with a single undo step.
+- Added spreadsheet-style Up/Down arrow navigation between editable TLK and
+  2DA table text fields.
 - Improved tab-strip sizing, active-tab contrast, light-theme readability,
   scrolling, and browser-style middle-click autoscroll.
 - Added KWin Wayland active-output placement without sacrificing XWayland file

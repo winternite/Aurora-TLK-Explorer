@@ -866,6 +866,47 @@ impl AuroraApp {
         *scroll_to_selected = true;
     }
 
+    /// Returns the adjacent visible row for a single-line table text editor.
+    /// Keeping this separate from row-selection keyboard handling lets text
+    /// fields use Up/Down as spreadsheet-style navigation without changing
+    /// multiline TLK editor cursor movement.
+    fn vertical_text_field_target(
+        current_visible_row: usize,
+        visible_row_count: usize,
+        direction: isize,
+    ) -> Option<usize> {
+        if visible_row_count == 0 || direction == 0 {
+            return None;
+        }
+        let target = current_visible_row
+            .saturating_add_signed(direction)
+            .min(visible_row_count - 1);
+        (target != current_visible_row).then_some(target)
+    }
+
+    fn text_field_vertical_movement(ui: &mut egui::Ui, response: &egui::Response) -> Option<isize> {
+        if !response.has_focus() {
+            return None;
+        }
+        ui.input_mut(|input| {
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                Some(-1)
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                Some(1)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn tlk_text_cell_id(document_id: u64, row: usize) -> Id {
+        Id::new(("tlk_text_cell", document_id, row))
+    }
+
+    fn twoda_text_cell_id(document_id: u64, row: usize, column: usize) -> Id {
+        Id::new(("twoda_text_cell", document_id, row, column))
+    }
+
     fn row_action_context_menu(
         response: &egui::Response,
         row: usize,
@@ -3195,8 +3236,10 @@ impl AuroraApp {
                         );
                     });
                     row.col(|ui| {
+                        let text_cell_id = Self::tlk_text_cell_id(doc.id, index);
                         let r = ui.add(
                             TextEdit::singleline(&mut entry.text)
+                                .id(text_cell_id)
                                 .frame(egui::Frame::NONE)
                                 .desired_width(f32::INFINITY),
                         );
@@ -3210,6 +3253,27 @@ impl AuroraApp {
                             doc.cell_selection_anchor = None;
                             doc.selected_row = Some(index);
                             doc.selected_column = Some(4);
+                        }
+                        if let Some(direction) = Self::text_field_vertical_movement(ui, &r)
+                            && let Some(target_visible) = Self::vertical_text_field_target(
+                                visible_index,
+                                visible_count,
+                                direction,
+                            )
+                        {
+                            let target_index = visible
+                                .as_ref()
+                                .map_or(target_visible, |rows| rows[target_visible]);
+                            doc.selected_rows.clear();
+                            doc.selection_anchor = None;
+                            doc.selected_cells.clear();
+                            doc.cell_selection_anchor = None;
+                            doc.selected_row = Some(target_index);
+                            doc.selected_column = Some(4);
+                            doc.scroll_to_selected = true;
+                            ui.memory_mut(|memory| {
+                                memory.request_focus(Self::tlk_text_cell_id(doc.id, target_index));
+                            });
                         }
                         Self::row_action_context_menu(
                             &r,
@@ -3693,8 +3757,11 @@ impl AuroraApp {
                                     ui.visuals().selection.bg_fill.gamma_multiply(0.72),
                                 );
                             }
+                            let text_cell_id =
+                                Self::twoda_text_cell_id(doc.id, row_index, column_index);
                             let response = ui.add(
                                 TextEdit::singleline(cell)
+                                    .id(text_cell_id)
                                     .frame(egui::Frame::NONE)
                                     .desired_width(f32::INFINITY),
                             );
@@ -3715,6 +3782,33 @@ impl AuroraApp {
                                 );
                                 doc.selected_row = Some(row_index);
                                 doc.selected_column = Some(column_index);
+                            }
+                            if let Some(direction) =
+                                Self::text_field_vertical_movement(ui, &response)
+                                && let Some(target_visible) = Self::vertical_text_field_target(
+                                    visible_index,
+                                    visible_count,
+                                    direction,
+                                )
+                            {
+                                let target_row = visible
+                                    .as_ref()
+                                    .map_or(target_visible, |rows| rows[target_visible]);
+                                doc.selected_rows.clear();
+                                doc.selection_anchor = None;
+                                doc.selected_columns.clear();
+                                doc.selected_cells = BTreeSet::from([(target_row, column_index)]);
+                                doc.cell_selection_anchor = Some((target_row, column_index));
+                                doc.selected_row = Some(target_row);
+                                doc.selected_column = Some(column_index);
+                                doc.scroll_to_selected = true;
+                                ui.memory_mut(|memory| {
+                                    memory.request_focus(Self::twoda_text_cell_id(
+                                        doc.id,
+                                        target_row,
+                                        column_index,
+                                    ));
+                                });
                             }
                             Self::row_action_context_menu(
                                 &response,
@@ -4998,5 +5092,15 @@ mod tests {
             first_row > 10_000,
             "standalone handle drag did not move proportionally"
         );
+    }
+
+    #[test]
+    fn vertical_text_navigation_stays_inside_visible_rows() {
+        assert_eq!(AuroraApp::vertical_text_field_target(0, 3, -1), None);
+        assert_eq!(AuroraApp::vertical_text_field_target(0, 3, 1), Some(1));
+        assert_eq!(AuroraApp::vertical_text_field_target(1, 3, -1), Some(0));
+        assert_eq!(AuroraApp::vertical_text_field_target(1, 3, 1), Some(2));
+        assert_eq!(AuroraApp::vertical_text_field_target(2, 3, 1), None);
+        assert_eq!(AuroraApp::vertical_text_field_target(0, 0, 1), None);
     }
 }

@@ -20,6 +20,7 @@ the corresponding source and third-party notices.
 - System, dark, and light themes
 - Search/filter, add, and delete rows
 - Insert one or more blank TLK or 2DA rows above or below the selected row
+- Use Up/Down to move between editable TLK and 2DA table text fields
 - Delete all selected 2DA rows in one undoable operation
 - Find/replace and find-next navigation
 - Row cut/copy/paste through the system clipboard and between tabs
